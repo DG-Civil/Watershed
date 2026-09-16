@@ -1,0 +1,21 @@
+# Python Runtime Environment
+python_version==3.9.6
+
+
+
+# Target Application Dependencies
+branca==0.8.2
+folium==0.20.0
+geopandas==1.0.1
+matplotlib==3.9.4
+numpy==2.0.2
+pandas==2.3.3
+pillow==11.3.0
+pyproj==3.6.1
+rasterio==1.4.3
+requests==2.32.5
+scipy==1.13.1
+shapely==2.0.7
+streamlit==1.50.0
+streamlit-folium==0.25.3
+whitebox==2.3.6
