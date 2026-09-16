@@ -1,4 +1,5 @@
 import base64
+import gc
 import io
 import os
 import tempfile
@@ -24,16 +25,12 @@ from pyproj import CRS, Transformer
 from rasterio.enums import Resampling
 from rasterio.io import MemoryFile
 from rasterio.merge import merge
-
 from rasterio.transform import Affine, array_bounds
 from rasterio.warp import calculate_default_transform, reproject
-
 from rasterio.windows import Window
 from scipy.interpolate import griddata
 from shapely.geometry import box
 from streamlit_folium import st_folium
-
-import gc
 
 st.set_page_config(
     page_title="Hydrology & CN Web Suite",
@@ -41,9 +38,60 @@ st.set_page_config(
     layout="wide",
 )
 
+US_STATES = [
+    "Alabama",
+    "Arizona",
+    "Arkansas",
+    "California",
+    "Colorado",
+    "Connecticut",
+    "Delaware",
+    "District of Columbia",
+    "Florida",
+    "Georgia",
+    "Idaho",
+    "Illinois",
+    "Indiana",
+    "Iowa",
+    "Kansas",
+    "Kentucky",
+    "Louisiana",
+    "Maine",
+    "Maryland",
+    "Massachusetts",
+    "Michigan",
+    "Minnesota",
+    "Mississippi",
+    "Missouri",
+    "Montana",
+    "Nebraska",
+    "Nevada",
+    "New Hampshire",
+    "New Jersey",
+    "New Mexico",
+    "New York",
+    "North Carolina",
+    "North Dakota",
+    "Ohio",
+    "Oklahoma",
+    "Oregon",
+    "Pennsylvania",
+    "Rhode Island",
+    "South Carolina",
+    "South Dakota",
+    "Tennessee",
+    "Texas",
+    "Utah",
+    "Vermont",
+    "Virginia",
+    "Washington",
+    "West Virginia",
+    "Wisconsin",
+    "Wyoming",
+]
 
 # -----------------------------------------------------------------------------
-# HELPER & IN-MEMORY RASTER FUNCTIONS
+# HELPER & IN-MEMORY RASTER / REST FUNCTIONS
 # -----------------------------------------------------------------------------
 
 
@@ -105,6 +153,57 @@ def parse_landxml_to_geotiff(xml_input, output_tif_path, res=2.0):
     return output_tif_path
 
 
+def fetch_texas_streams_rest(target_crs, native_bounds):
+    """
+    Queries TxGIO ArcGIS REST service (NHD_TX_Rivers_Streams, Layer 1) 
+    for stream vectors intersecting the DEM native bounds.
+    """
+    min_x, min_y, max_x, max_y = native_bounds
+    
+    # 1. Transform all 4 corners of the native DEM extent to EPSG:4326 (WGS84)
+    transformer = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
+    corners = [
+        (min_x, min_y),
+        (min_x, max_y),
+        (max_x, min_y),
+        (max_x, max_y),
+    ]
+    lons, lats = zip(*[transformer.transform(x, y) for x, y in corners])
+    
+    xmin, xmax = min(lons), max(lons)
+    ymin, ymax = min(lats), max(lats)
+
+    # 2. Query Layer 1 (Streams) instead of Layer 0 (Waterbodies) using EPSG:4326
+    url = (
+        "https://feature.geographic.texas.gov/arcgis/rest/services/"
+        "Hydrography/Tx_Rivers_Streams_Waterbodies/MapServer/1/query"
+    )
+    params = {
+        "where": "1=1",
+        "geometry": f"{xmin},{ymin},{xmax},{ymax}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "*",
+        "returnGeometry": "true",
+        "f": "geojson",
+        "outSR": "4326",
+    }
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    response = requests.get(url, params=params, headers=headers, timeout=60)
+    response.raise_for_status()
+    geojson_data = response.json()
+
+    if not geojson_data.get("features"):
+        return None
+
+    gdf = gpd.GeoDataFrame.from_features(geojson_data, crs="EPSG:4326")
+    if gdf.empty:
+        return None
+
+    return gdf.to_crs(target_crs)
+
 def extract_uploaded_archive_in_temp(uploaded_file, extract_to):
     """Extracts uploaded zip archive into target temp directory."""
     zip_bytes = io.BytesIO(uploaded_file.getbuffer())
@@ -157,10 +256,28 @@ with tab1:
             accept_multiple_files=True,
         )
 
-        stream_burn_file = st.file_uploader(
-            "Upload Streams for DEM Burning (Optional ZIP Shapefile)",
-            type=["zip"],
+        st.markdown("**DEM Stream Burning (Optional)**")
+        stream_option = st.radio(
+            "Select Stream Vector Source:",
+            [
+                "None",
+                "Upload Stream Shapefile (ZIP)",
+                "Use Texas Gov Dataset (ArcGIS REST)",
+            ],
+            index=0,
+            help="Burn streams into DEM prior to flow accumulation processing.",
         )
+
+        stream_burn_file = None
+        if stream_option == "Upload Stream Shapefile (ZIP)":
+            stream_burn_file = st.file_uploader(
+                "Upload Streams (ZIP Shapefile)",
+                type=["zip"],
+            )
+        elif stream_option == "Use Texas Gov Dataset (ArcGIS REST)":
+            st.info(
+                "ℹ️ **Note:** The Texas hydrography dataset only applies to areas within the State of Texas."
+            )
 
         threshold = st.number_input(
             "Flow Accumulation Threshold", min_value=1, value=1000, step=50
@@ -172,7 +289,6 @@ with tab1:
             step=10.0,
         )
 
-        # Multi-file validation & DEM loading logic
         if terrain_files:
             total_size_mb = sum(f.size for f in terrain_files) / (1024 * 1024)
             if total_size_mb > 150:
@@ -182,7 +298,9 @@ with tab1:
                 st.stop()
 
             is_multi = len(terrain_files) > 1
-            has_xml = any(f.name.lower().endswith(".xml") for f in terrain_files)
+            has_xml = any(
+                f.name.lower().endswith(".xml") for f in terrain_files
+            )
 
             if is_multi and has_xml:
                 st.error(
@@ -202,7 +320,6 @@ with tab1:
                 ]
                 st.session_state["last_filenames"] = current_filenames
 
-                # Process Rasters in RAM for Multi-Overlay & Bounds Calculation
                 processed_dems = []
                 global_min = float("inf")
                 global_max = float("-inf")
@@ -212,7 +329,9 @@ with tab1:
                 native_min_x, native_min_y = float("inf"), float("inf")
                 native_max_x, native_max_y = float("-inf"), float("-inf")
 
-                with st.spinner("Processing elevation surfaces and map overlay..."):
+                with st.spinner(
+                    "Processing elevation surfaces and map overlay..."
+                ):
                     with tempfile.TemporaryDirectory() as preview_dir:
                         for dem_item in st.session_state["dem_files_data"]:
                             dem_tif_path = os.path.join(
@@ -235,10 +354,18 @@ with tab1:
                                         else f"+proj=tmerc +lat_0={(src.bounds.bottom + src.bounds.top)/2} +lon_0={(src.bounds.left + src.bounds.right)/2} +k=1.0 +x_0=0 +y_0=0 +units=m +no_defs"
                                     )
 
-                                native_min_x = min(native_min_x, src.bounds.left)
-                                native_max_x = max(native_max_x, src.bounds.right)
-                                native_min_y = min(native_min_y, src.bounds.bottom)
-                                native_max_y = max(native_max_y, src.bounds.top)
+                                native_min_x = min(
+                                    native_min_x, src.bounds.left
+                                )
+                                native_max_x = max(
+                                    native_max_x, src.bounds.right
+                                )
+                                native_min_y = min(
+                                    native_min_y, src.bounds.bottom
+                                )
+                                native_max_y = max(
+                                    native_max_y, src.bounds.top
+                                )
 
                                 dst_crs = "EPSG:4326"
                                 transform, width, height = (
@@ -328,6 +455,12 @@ with tab1:
                 st.session_state["map_bounds"] = united_bounds
                 st.session_state["zoom_bounds"] = united_bounds
                 st.session_state["target_crs"] = primary_crs
+                st.session_state["native_bounds"] = (
+                    native_min_x,
+                    native_min_y,
+                    native_max_x,
+                    native_max_y,
+                )
                 st.session_state["outlet_x"] = (
                     native_min_x + native_max_x
                 ) / 2.0
@@ -338,19 +471,14 @@ with tab1:
                 st.session_state.pop("downslope_gdf", None)
                 st.session_state.pop("watershed_results", None)
 
-        # if stream_burn_file is not None:
-        #     st.session_state["burn_streams_bytes"] = stream_burn_file.getbuffer()
-        # Replace lines 274-275 with:
-        if stream_burn_file is not None:
+        if stream_option == "Upload Stream Shapefile (ZIP)" and stream_burn_file is not None:
             st.session_state["burn_streams_bytes"] = stream_burn_file.getbuffer()
             try:
-                # Ephemeral extraction to load shapefile into RAM
                 with tempfile.TemporaryDirectory() as temp_dir:
                     zip_bytes = io.BytesIO(stream_burn_file.getvalue())
                     with zipfile.ZipFile(zip_bytes, "r") as z:
                         z.extractall(temp_dir)
 
-                    # Search for .shp file (handles nested subfolders inside ZIP)
                     shp_path = None
                     for root, _, files in os.walk(temp_dir):
                         for file in files:
@@ -366,10 +494,10 @@ with tab1:
                         st.error("❌ No .shp file found inside the uploaded ZIP archive.")
             except Exception as e:
                 st.error(f"❌ Failed to parse uploaded stream ZIP shapefile: {e}")
-        else:
+        elif stream_option == "None":
             st.session_state.pop("burn_streams_bytes", None)
-            st.session_state.pop("uploaded_streams_gdf", None)            
-            
+            st.session_state.pop("uploaded_streams_gdf", None)
+
         st.markdown("---")
         st.subheader("2. Outlet Location (Native Coordinates)")
         crs_label = str(st.session_state.get("target_crs", "Projected CRS"))
@@ -388,9 +516,13 @@ with tab1:
 
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
-            zoom_click = st.button("🔍 Zoom to Terrain", use_container_width=True)
+            zoom_click = st.button(
+                "🔍 Zoom to Terrain", use_container_width=True
+            )
             if zoom_click and "map_bounds" in st.session_state:
-                st.session_state["zoom_bounds"] = st.session_state["map_bounds"]
+                st.session_state["zoom_bounds"] = st.session_state[
+                    "map_bounds"
+                ]
 
         with col_btn2:
             run_delineate = st.button(
@@ -399,7 +531,6 @@ with tab1:
                 use_container_width=True,
             )
 
-        # RESULTS & DOWNLOAD PORTAL
         if "watershed_results" in st.session_state:
             st.markdown("---")
             st.subheader("📊 Watershed Metrics")
@@ -443,7 +574,6 @@ with tab1:
 
         m = folium.Map(location=[marker_lat, marker_lon], zoom_start=13)
 
-        # Outline styling for map headers
         legend_css = """
         <style>
         svg text {
@@ -459,7 +589,6 @@ with tab1:
         """
         m.get_root().header.add_child(folium.Element(legend_css))
 
-        # Build shared Colormap and ImageOverlays for DEMs
         if "processed_dems" in st.session_state:
             p_dems = st.session_state["processed_dems"]
             g_min = st.session_state["global_min"]
@@ -532,24 +661,25 @@ with tab1:
                 name="Longest Flow Path",
                 style_function=lambda x: {"color": "orange", "weight": 3},
             ).add_to(m)
-            
-        # Display Uploaded Stream Lines for DEM Burning
+
         if "uploaded_streams_gdf" in st.session_state:
             try:
-                uploaded_4326 = st.session_state["uploaded_streams_gdf"].to_crs("EPSG:4326")
+                uploaded_4326 = st.session_state[
+                    "uploaded_streams_gdf"
+                ].to_crs("EPSG:4326")
                 folium.GeoJson(
                     uploaded_4326,
-                    name="Uploaded Burn-in Streams",
+                    name="Burn-in Streams",
                     style_function=lambda x: {
-                        "color": "#00FFFF",  # Cyan highlight
+                        "color": "#00FFFF",
                         "weight": 3,
                         "opacity": 0.9,
-                        "dashArray": "4, 4"
+                        "dashArray": "4, 4",
                     },
-                    tooltip="Uploaded Stream Line (Burn-in Channel)"
+                    tooltip="Burn-in Stream Channel",
                 ).add_to(m)
             except Exception as e:
-                st.warning(f"Could not render uploaded streams on map: {e}")
+                st.warning(f"Could not render burn-in streams on map: {e}")
 
         if "downslope_gdf" in st.session_state:
             folium.GeoJson(
@@ -597,9 +727,6 @@ with tab1:
             except Exception as e:
                 st.error(f"Map interaction error: {str(e)}")
 
-    # -------------------------------------------------------------------------
-    # WHITEBOXTOOLS PIPELINE (SCOPED TEMP DIR FOR AUTO-CLEANUP)
-    # -------------------------------------------------------------------------
     if run_delineate:
         if "dem_files_data" not in st.session_state or not st.session_state[
             "dem_files_data"
@@ -623,7 +750,6 @@ with tab1:
                         with open(merged_dem_path, "wb") as f:
                             f.write(item["bytes"])
                 else:
-                    # Merge multiple GeoTIFF files into a single continuous surface
                     tif_paths = []
                     for idx, item in enumerate(dem_items):
                         p = os.path.join(work_dir, f"part_{idx}.tif")
@@ -652,15 +778,15 @@ with tab1:
 
                     for src in src_files_to_mosaic:
                         src.close()
-                        
+
                     del mosaic, src_files_to_mosaic
                     gc.collect()
 
+                # Determine Burn-in Stream Vector Input
                 burn_streams_path = None
-                if "burn_streams_bytes" in st.session_state:
-                    burn_bytes = io.BytesIO(
-                        st.session_state["burn_streams_bytes"]
-                    )
+
+                if stream_option == "Upload Stream Shapefile (ZIP)" and "burn_streams_bytes" in st.session_state:
+                    burn_bytes = io.BytesIO(st.session_state["burn_streams_bytes"])
                     burn_dir = os.path.join(work_dir, "burn_shp")
                     os.makedirs(burn_dir, exist_ok=True)
                     with zipfile.ZipFile(burn_bytes, "r") as z:
@@ -670,27 +796,28 @@ with tab1:
                             if file.endswith(".shp"):
                                 burn_streams_path = os.path.join(root, file)
 
-                with st.spinner("Executing WhiteboxTools hydrology workflow..."):
+                elif stream_option == "Use Texas Gov Dataset (ArcGIS REST)":
+                    with st.spinner("Fetching NHD stream vectors from TxGIO ArcGIS REST service..."):
+                        try:
+                            tx_streams_gdf = fetch_texas_streams_rest(
+                                target_crs, st.session_state["native_bounds"]
+                            )
+                            if tx_streams_gdf is not None and not tx_streams_gdf.empty:
+                                st.session_state["uploaded_streams_gdf"] = tx_streams_gdf
+                                burn_streams_path = os.path.join(work_dir, "tx_rest_streams.shp")
+                                tx_streams_gdf.to_file(burn_streams_path)
+                                st.toast(f"Retrieved {len(tx_streams_gdf)} stream segments from TxGIO.")
+                            else:
+                                st.warning("No Texas hydrography streams found in DEM extent.")
+                        except Exception as e:
+                            st.error(f"Failed to fetch Texas REST streams: {e}")
+
+                with st.spinner(
+                    "Executing WhiteboxTools hydrology workflow..."
+                ):
                     wbt = whitebox.WhiteboxTools()
                     wbt.set_verbose_mode(False)
 
-                    # # Step 1: Fill Depressions
-                    # filled_dem = os.path.join(work_dir, "filled_dem.tif")
-                    # wbt.fill_depressions(
-                    #     dem=merged_dem_path, output=filled_dem, fix_flats=True
-                    # )
-
-                    # dem_to_use = filled_dem
-                    # if burn_streams_path and os.path.exists(burn_streams_path):
-                    #     burned_dem = os.path.join(work_dir, "burned_dem.tif")
-                    #     wbt.fill_burn(
-                    #         dem=filled_dem,
-                    #         streams=burn_streams_path,
-                    #         output=burned_dem,
-                    #     )
-                    #     dem_to_use = burned_dem
-                    
-                    # Step 1: Fill Depressions
                     filled_dem = os.path.join(work_dir, "filled_dem.tif")
                     wbt.fill_depressions(
                         dem=merged_dem_path, output=filled_dem, fix_flats=True
@@ -698,15 +825,14 @@ with tab1:
 
                     dem_to_use = filled_dem
 
-                    # Step 1b: Reproject and Burn Uploaded Streams
-                    if "uploaded_streams_gdf" in st.session_state:
-                        burn_gdf = st.session_state["uploaded_streams_gdf"].copy()
-                        
-                        # Ensure Stream CRS matches DEM Target CRS
+                    if burn_streams_path and os.path.exists(burn_streams_path):
+                        burn_gdf = gpd.read_file(burn_streams_path)
                         if burn_gdf.crs != target_crs:
                             burn_gdf = burn_gdf.to_crs(target_crs)
 
-                        temp_burn_shp = os.path.join(work_dir, "burn_streams_reproj.shp")
+                        temp_burn_shp = os.path.join(
+                            work_dir, "burn_streams_reproj.shp"
+                        )
                         burn_gdf.to_file(temp_burn_shp)
 
                         burned_dem = os.path.join(work_dir, "burned_dem.tif")
@@ -716,18 +842,18 @@ with tab1:
                             output=burned_dem,
                         )
 
-                        if os.path.exists(burned_dem) and os.path.getsize(burned_dem) > 0:
+                        if (
+                            os.path.exists(burned_dem)
+                            and os.path.getsize(burned_dem) > 0
+                        ):
                             dem_to_use = burned_dem
-                            
-                            
-                    # Step 2: D8 Pointer & Flow Accumulation
+
                     d8_pointer = os.path.join(work_dir, "d8_pointer.tif")
                     wbt.d8_pointer(dem=dem_to_use, output=d8_pointer)
 
                     flow_acc = os.path.join(work_dir, "flow_acc.tif")
                     wbt.d8_flow_accumulation(i=dem_to_use, output=flow_acc)
 
-                    # Step 3: Extract Streams
                     streams_raster = os.path.join(
                         work_dir, "streams_raster.tif"
                     )
@@ -746,7 +872,6 @@ with tab1:
                         output=streams_vector,
                     )
 
-                    # Step 4: Snap Pour Point to Maximum Flow Accumulation
                     outlet_gdf = gpd.GeoDataFrame(
                         geometry=[sg.Point(x_coord, y_coord)], crs=target_crs
                     )
@@ -780,7 +905,6 @@ with tab1:
                         snap_dist=effective_snap_dist,
                     )
 
-                    # Step 5: Delineate Watershed
                     watershed_raster = os.path.join(
                         work_dir, "watershed_raster.tif"
                     )
@@ -792,6 +916,7 @@ with tab1:
 
                     with rasterio.open(watershed_raster) as src_ws:
                         ws_data = src_ws.read(1)
+                        ws_pixel_count = np.sum(ws_data > 0)
                         shapes_gen = rasterio.features.shapes(
                             ws_data,
                             mask=(ws_data > 0),
@@ -814,7 +939,6 @@ with tab1:
                     )
                     st.session_state["aoi_gdf"] = watershed_gdf
 
-                    # Clip streams to watershed
                     stream_clipped_path = os.path.join(
                         work_dir, "streams_clipped.shp"
                     )
@@ -828,7 +952,6 @@ with tab1:
                         st.session_state["stream_gdf"] = stream_clipped_gdf
                         stream_clipped_gdf.to_file(stream_clipped_path)
 
-                    # Step 6: Longest Flow Path
                     flowpath_shp = os.path.join(
                         work_dir, "longest_flowpath.shp"
                     )
@@ -838,16 +961,30 @@ with tab1:
                         output=flowpath_shp,
                     )
 
-                    longest_flow_m = 0.0
+                    longest_flow_ft = 0.0
+                    longest_flow_mi = 0.0
+                    
                     if os.path.exists(flowpath_shp):
-                        fp_gdf = gpd.read_file(flowpath_shp).set_crs(
-                            target_crs
-                        )
+                        fp_gdf = gpd.read_file(flowpath_shp).set_crs(target_crs)
                         st.session_state["flowpath_gdf"] = fp_gdf
+                        
                         if not fp_gdf.empty:
-                            longest_flow_m = fp_gdf.geometry.length.sum()
+                            # Reproject to local UTM if in degrees, or handle Feet vs Meters natively
+                            if is_deg:
+                                utm_crs = fp_gdf.estimate_utm_crs()
+                                fp_proj = fp_gdf.to_crs(utm_crs)
+                                length_m = fp_proj.geometry.length.sum()
+                                longest_flow_ft = length_m * 3.28084
+                                longest_flow_mi = length_m / 1609.34
+                            elif is_feet:
+                                length_ft = fp_gdf.geometry.length.sum()
+                                longest_flow_ft = length_ft
+                                longest_flow_mi = length_ft / 5280.0
+                            else:  # Native units are meters
+                                length_m = fp_gdf.geometry.length.sum()
+                                longest_flow_ft = length_m * 3.28084
+                                longest_flow_mi = length_m / 1609.34
 
-                    # Step 7: Downslope Water Path
                     downslope_shp = os.path.join(
                         work_dir, "downslope_flowpath.shp"
                     )
@@ -862,7 +999,6 @@ with tab1:
                         )
                         st.session_state["downslope_gdf"] = ds_gdf
 
-                    # Area Calculations
                     with rasterio.open(dem_to_use) as src_dem:
                         cell_area_native = abs(src_dem.transform[0]) * abs(
                             src_dem.transform[4]
@@ -874,22 +1010,24 @@ with tab1:
                         except Exception:
                             is_feet = False
 
-                    area_native_total = np.sum(ws_data > 0) * cell_area_native
+                    area_native_total = ws_pixel_count * cell_area_native
                     if is_feet:
                         area_sqmi = area_native_total / 27878400.0
                         area_acres = area_native_total / 43560.0
                     else:
                         area_sqmi = area_native_total / 2589988.11
                         area_acres = area_native_total / 4046.86
+                        
+                        
+                    
 
                     st.session_state["watershed_results"] = {
                         "area_sqmi": area_sqmi,
                         "area_acres": area_acres,
-                        "longest_flow_mi": longest_flow_m / 1609.34,
-                        "longest_flow_ft": longest_flow_m * 3.28084,
+                        "longest_flow_mi": longest_flow_mi,
+                        "longest_flow_ft": longest_flow_ft,
                     }
 
-                    # Bundle Zip Package into RAM Buffer
                     zip_buffer = io.BytesIO()
                     with zipfile.ZipFile(
                         zip_buffer, "w", zipfile.ZIP_DEFLATED
@@ -909,6 +1047,9 @@ with tab1:
                                 gpd.read_file(snapped_pour_pts)
                                 if os.path.exists(snapped_pour_pts)
                                 else None
+                            ), 
+                            "burn_in_streams": st.session_state.get(
+                                "uploaded_streams_gdf"
                             ),
                         }
                         for layer_name, gdf in layers_to_export.items():
@@ -984,78 +1125,78 @@ def extract_local_nlcd_windowed(src, aoi_proj):
 
     nlcd_gdf = gpd.GeoDataFrame.from_features(list(results), crs=src.crs)
     nlcd_gdf = nlcd_gdf.dissolve(by="land_use").reset_index()
-    
+
     del data, inside_mask, valid_mask, results
     gc.collect()
-    
+
     return nlcd_gdf
 
 
-# def fetch_nlcd_dataset(aoi_gdf, local_tif_path="NLCD_2025_Clipped_Root.tif"):
-#     if not os.path.exists(local_tif_path):
-#         raise FileNotFoundError(
-#             f"Root file '{local_tif_path}' not found. Ensure it is in the project repository."
-#         )
-
-#     try:
-#         with rasterio.open(local_tif_path) as src:
-#             aoi_local = aoi_gdf.to_crs(src.crs)
-#             aoi_geom = aoi_local.geometry.unary_union
-#             tif_extent = box(*src.bounds)
-
-#             if tif_extent.covers(aoi_geom) or tif_extent.intersects(aoi_geom):
-#                 nlcd_gdf = extract_local_nlcd_windowed(src, aoi_local)
-#                 return nlcd_gdf, "2025 Local NLCD Dataset"
-#             else:
-#                 raise ValueError("Outside bounds.")
-#     except Exception:
-#         raise ValueError(
-#             "Area is outside coverage. Download coverage from the MRLC website."
-#         )
-
 def fetch_nlcd_dataset(aoi_gdf):
     """Downloads NLCD 2021 data dynamically via MRLC WCS based on AOI bounds."""
-    # Target CRS for MRLC NLCD is EPSG:5070
     aoi_5070 = aoi_gdf.to_crs("EPSG:5070")
     bounds = aoi_5070.total_bounds
-    
-    # Buffer bounds by 30 meters to ensure full coverage
+
     xmin, ymin = bounds[0] - 30, bounds[1] - 30
     xmax, ymax = bounds[2] + 30, bounds[3] + 30
-    
+
     width = int((xmax - xmin) / 30)
     height = int((ymax - ymin) / 30)
     bbox_str = f"{xmin},{ymin},{xmax},{ymax}"
-    
+
     wcs_url = (
         "https://www.mrlc.gov/geoserver/ows?version=1.1.0&SERVICE=WCS&VERSION=1.0.0&"
         "request=GetCoverage&format=GeoTIFF&coverage=mrlc_download:NLCD_2021_Land_Cover_L48&"
         f"crs=EPSG:5070&width={width}&height={height}&bbox={bbox_str}"
     )
-    
-    # Create a unique temporary file
+
     temp_fd, temp_path = tempfile.mkstemp(suffix=".tif")
     os.close(temp_fd)
-    
+
     try:
         response = requests.get(wcs_url, stream=True, timeout=120)
         response.raise_for_status()
-        
-        with open(temp_path, 'wb') as f:
+
+        with open(temp_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
-                
+
         with rasterio.open(temp_path) as src:
             nlcd_gdf = extract_local_nlcd_windowed(src, aoi_5070)
             return nlcd_gdf, "MRLC WCS NLCD 2021 Dataset"
-            
+
     except Exception as e:
-        raise ValueError(f"Failed to download or process NLCD data from MRLC: {str(e)}")
+        raise ValueError(
+            f"Failed to download or process NLCD data from MRLC: {str(e)}"
+        )
     finally:
-        # Cleanup temporary file to prevent memory leaks
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+
+def fetch_local_nlcd_2025(aoi_gdf, state_name, nlcd_year):
+    """Loads NLCD land cover data from local NLCD/<year>/<state>.tif file."""
+    year_str = str(nlcd_year)
+    possible_paths = [
+        os.path.join("NLCD", year_str, f"{state_name}.tif"),
+        os.path.join("NLCD", year_str, f"{state_name.replace(' ', '_')}.tif"),
+    ]
+
+    tif_path = None
+    for p in possible_paths:
+        if os.path.exists(p):
+            tif_path = p
+            break
+
+    if not tif_path:
+        raise FileNotFoundError(
+            f"Local NLCD {nlcd_year} raster file not found for '{state_name}'. Expected at: {possible_paths[0]}"
+        )
+
+    with rasterio.open(tif_path) as src:
+        aoi_proj = aoi_gdf.to_crs(src.crs)
+        nlcd_gdf = extract_local_nlcd_windowed(src, aoi_proj)
+        return nlcd_gdf, f"Local NLCD {nlcd_year} Dataset ({state_name})"
 
 
 def download_ssurgo_extended(aoi_gdf):
@@ -1115,7 +1256,9 @@ def clean_hsg(val):
 
 def calculate_weighted_cn(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
     target_crs = (
-        aoi_gdf.crs if (aoi_gdf.crs and aoi_gdf.crs.is_projected) else "EPSG:5070"
+        aoi_gdf.crs
+        if (aoi_gdf.crs and aoi_gdf.crs.is_projected)
+        else "EPSG:5070"
     )
 
     aoi_proj = aoi_gdf.to_crs(target_crs)
@@ -1185,10 +1328,16 @@ def calculate_weighted_cn(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
     merged["area_x_cn"] = merged["area_sqm"] * merged["cn"]
 
     weighted_cn = merged["area_x_cn"].sum() / total_area
-    
-    del ssurgo_clipped, nlcd_clipped, ssurgo_grouped, nlcd_grouped, final_intersect
+
+    del (
+        ssurgo_clipped,
+        nlcd_clipped,
+        ssurgo_grouped,
+        nlcd_grouped,
+        final_intersect,
+    )
     gc.collect()
-    
+
     return weighted_cn, merged
 
 
@@ -1273,41 +1422,31 @@ with tab2:
 
     input_source = st.radio(
         "Select Drainage Area Input:",
-        ["Use Watershed from Watershed Delineation Tab", "Upload Zipped Shapefile"],
+        [
+            "Use Watershed from Watershed Delineation Tab",
+            "Upload Zipped Shapefile",
+        ],
     )
 
-    # if input_source == "Use Watershed from Watershed Delineation Tab":
-    #     if (
-    #         "aoi_gdf" in st.session_state
-    #         and st.session_state["aoi_gdf"] is not None
-    #     ):
-    #         st.session_state["cn_aoi_gdf"] = st.session_state["aoi_gdf"]
-    #     else:
-    #         st.warning("No watershed delineated in Tab 1 yet.")
-    #         st.session_state.pop("cn_aoi_gdf", None)
-    # elif input_source == "Upload Zipped Shapefile":
-    #     zip_upload = st.file_uploader(
-    #         "Upload Drainage Area (ZIP containing .shp)", type=["zip"]
-    #     )
-    #     if zip_upload:
-    #         with tempfile.TemporaryDirectory() as temp_dir:
-    #             shp_path = extract_uploaded_archive_in_temp(
-    #                 zip_upload, temp_dir
-    #             )
-    #             if shp_path:
-    #                 st.session_state["cn_aoi_gdf"] = gpd.read_file(shp_path)
-    #             else:
-    #                 st.error("No valid .shp file found in the ZIP.")
-    
     if input_source == "Use Watershed from Watershed Delineation Tab":
         if (
             "aoi_gdf" in st.session_state
             and st.session_state["aoi_gdf"] is not None
         ):
-            if st.session_state.get("cn_aoi_gdf") is not st.session_state["aoi_gdf"]:
+            if (
+                st.session_state.get("cn_aoi_gdf")
+                is not st.session_state["aoi_gdf"]
+            ):
                 st.session_state["cn_aoi_gdf"] = st.session_state["aoi_gdf"]
-                b = st.session_state["cn_aoi_gdf"].to_crs("EPSG:4326").total_bounds
-                st.session_state["cn_zoom_bounds"] = [[b[1], b[0]], [b[3], b[2]]]
+                b = (
+                    st.session_state["cn_aoi_gdf"]
+                    .to_crs("EPSG:4326")
+                    .total_bounds
+                )
+                st.session_state["cn_zoom_bounds"] = [
+                    [b[1], b[0]],
+                    [b[3], b[2]],
+                ]
         else:
             st.warning("No watershed delineated in Tab 1 yet.")
             st.session_state.pop("cn_aoi_gdf", None)
@@ -1324,34 +1463,46 @@ with tab2:
                     uploaded_gdf = gpd.read_file(shp_path)
                     st.session_state["cn_aoi_gdf"] = uploaded_gdf
                     b = uploaded_gdf.to_crs("EPSG:4326").total_bounds
-                    st.session_state["cn_zoom_bounds"] = [[b[1], b[0]], [b[3], b[2]]]
+                    st.session_state["cn_zoom_bounds"] = [
+                        [b[1], b[0]],
+                        [b[3], b[2]],
+                    ]
                 else:
                     st.error("No valid .shp file found in the ZIP.")
-                    
+
+    st.markdown("---")
+    st.subheader("NLCD Data Settings")
+    nlcd_year = st.selectbox(
+        "Select NLCD Year:", [2021, 2017, 2025], index=0, key="nlcd_year_select"
+    )
+
+    selected_state = None
+    if nlcd_year in (2017, 2025):
+        selected_state = st.selectbox(
+            "Select State for Drainage Area:",
+            US_STATES,
+            key="nlcd_state_select",
+        )
 
     has_aoi = "cn_aoi_gdf" in st.session_state
     has_nlcd = "cn_nlcd_gdf" in st.session_state
     has_ssurgo = "cn_ssurgo_gdf" in st.session_state
     has_cn = "cn_intersected_gdf" in st.session_state
-    
-    ######### new Added
-    
 
     st.markdown("---")
     st.subheader("User Curve Number Lookup")
-    
+
     lookup_col1, lookup_col2 = st.columns([2, 1])
     with lookup_col1:
         lookup_upload = st.file_uploader(
-            "Upload Custom NLCD-HSG CN Lookup Table (.csv)", 
+            "Upload Custom NLCD-HSG CN Lookup Table (.csv)",
             type=["csv"],
-            help="Optional. If not uploaded, the default root folder table will be used."
+            help="Optional. If not uploaded, the default root folder table will be used.",
         )
-        
+
     with lookup_col2:
         default_lookup_path = "NLCD_SHG_CN_lookup.csv"
-        # Push the download button down slightly to align with the file uploader box
-        st.write("") 
+        st.write("")
         st.write("")
         if os.path.exists(default_lookup_path):
             with open(default_lookup_path, "rb") as f:
@@ -1360,99 +1511,43 @@ with tab2:
                     data=f,
                     file_name="Sample_NLCD_SHG_CN_lookup.csv",
                     mime="text/csv",
-                    use_container_width=True
+                    use_container_width=True,
                 )
         else:
             st.info("Sample table not found in root directory.")
 
-    
-    ########################
-    
     st.markdown("---")
     col_btn1, col_btn2, col_btn3 = st.columns(3)
 
-    # with col_btn1:
-    #     if st.button(
-    #         "📥 1. Download NLCD", disabled=not has_aoi, use_container_width=True
-    #     ):
-    #         with st.spinner(
-    #             "Checking area extent and processing NLCD Land Cover dataset..."
-    #         ):
-    #             try:
-    #                 nlcd_gdf, source_ver = fetch_nlcd_dataset(
-    #                     st.session_state["cn_aoi_gdf"],
-    #                     local_tif_path="NLCD_2025_Clipped_Root.tif",
-    #                 )
-    #                 st.session_state["cn_nlcd_gdf"] = nlcd_gdf
-    #                 st.session_state["nlcd_source_version"] = source_ver
-    #                 st.rerun()
-    #             except Exception as e:
-    #                 st.error(str(e))
-
-    # with col_btn2:
-    #     if st.button(
-    #         "📥 2. Download SSURGO",
-    #         disabled=not has_aoi,
-    #         use_container_width=True,
-    #     ):
-    #         with st.spinner("Downloading SSURGO Soils via USDA WFS in RAM..."):
-    #             try:
-    #                 st.session_state["cn_ssurgo_gdf"] = download_ssurgo_extended(
-    #                     st.session_state["cn_aoi_gdf"]
-    #                 )
-    #                 st.rerun()
-    #             except Exception as e:
-    #                 st.error(f"SSURGO Download Failed: {e}")
-
-    # with col_btn3:
-    #     if st.button(
-    #         "📊 3. Calculate CN",
-    #         disabled=not (has_aoi and has_nlcd and has_ssurgo),
-    #         type="primary",
-    #         use_container_width=True,
-    #     ):
-    #         lookup_path = "NLCD_SHG_CN_lookup.csv"
-    #         if not os.path.exists(lookup_path):
-    #             st.error(f"Lookup table '{lookup_path}' not found in root folder.")
-    #         else:
-    #             with st.spinner(
-    #                 "Intersecting layers and calculating weighted CN..."
-    #             ):
-    #                 try:
-    #                     weighted_cn, intersected_gdf = calculate_weighted_cn(
-    #                         st.session_state["cn_aoi_gdf"],
-    #                         st.session_state["cn_nlcd_gdf"],
-    #                         st.session_state["cn_ssurgo_gdf"],
-    #                         lookup_path,
-    #                     )
-    #                     st.session_state["final_cn"] = weighted_cn
-    #                     st.session_state["cn_intersected_gdf"] = intersected_gdf
-
-    #                     st.session_state["cn_zip_bytes"] = (
-    #                         bundle_cn_project_zip_in_memory(
-    #                             st.session_state["cn_aoi_gdf"],
-    #                             st.session_state["cn_ssurgo_gdf"],
-    #                             st.session_state["cn_nlcd_gdf"],
-    #                             intersected_gdf,
-    #                         )
-    #                     )
-    #                     st.rerun()
-    #                 except Exception as e:
-    #                     st.error(f"Calculation Error: {e}")
-    
     with col_btn1:
         if st.button(
-            "📥 1. Download NLCD", disabled=not has_aoi, use_container_width=True
+            "📥 1. Download NLCD",
+            disabled=not has_aoi,
+            use_container_width=True,
         ):
-            with st.spinner(
-                "Downloading NLCD Land Cover dataset from MRLC WCS..."
-            ):
+            with st.spinner(f"Processing NLCD {nlcd_year} Land Cover dataset..."):
                 try:
-                    nlcd_gdf, source_ver = fetch_nlcd_dataset(st.session_state["cn_aoi_gdf"])
-                    st.session_state["cn_nlcd_gdf"] = nlcd_gdf
-                    st.session_state["nlcd_source_version"] = source_ver
-                    gc.collect()
-                    st.rerun()
+                    if nlcd_year in (2017, 2025):
+                        if not selected_state:
+                            st.error(
+                                "Please select a state for NLCD {nlcd_year} dataset."
+                            )
+                        else:
+                            nlcd_gdf, source_ver = fetch_local_nlcd_2025(
+                                st.session_state["cn_aoi_gdf"], selected_state, nlcd_year,
+                            )
+                            st.session_state["cn_nlcd_gdf"] = nlcd_gdf
+                            st.session_state["nlcd_source_version"] = source_ver
+                            gc.collect()
+                            st.rerun()
+                    else:
+                        nlcd_gdf, source_ver = fetch_nlcd_dataset(
+                            st.session_state["cn_aoi_gdf"]
+                        )
+                        st.session_state["cn_nlcd_gdf"] = nlcd_gdf
+                        st.session_state["nlcd_source_version"] = source_ver
+                        gc.collect()
+                        st.rerun()
                 except Exception as e:
                     st.error(str(e))
 
@@ -1464,8 +1559,8 @@ with tab2:
         ):
             with st.spinner("Downloading SSURGO Soils via USDA WFS in RAM..."):
                 try:
-                    st.session_state["cn_ssurgo_gdf"] = download_ssurgo_extended(
-                        st.session_state["cn_aoi_gdf"]
+                    st.session_state["cn_ssurgo_gdf"] = (
+                        download_ssurgo_extended(st.session_state["cn_aoi_gdf"])
                     )
                     gc.collect()
                     st.rerun()
@@ -1479,20 +1574,25 @@ with tab2:
             type="primary",
             use_container_width=True,
         ):
-            with st.spinner("Intersecting layers and calculating weighted CN..."):
+            with st.spinner(
+                "Intersecting layers and calculating weighted CN..."
+            ):
                 temp_lookup_path = None
                 try:
-                    # Switch logic between uploaded file or root file
                     if lookup_upload is not None:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                        with tempfile.NamedTemporaryFile(
+                            delete=False, suffix=".csv"
+                        ) as tmp:
                             tmp.write(lookup_upload.getvalue())
                             temp_lookup_path = tmp.name
                         active_lookup_path = temp_lookup_path
                     else:
                         active_lookup_path = "NLCD_SHG_CN_lookup.csv"
-                    
+
                     if not os.path.exists(active_lookup_path):
-                        st.error(f"Lookup table '{active_lookup_path}' not found. Please upload one or ensure it exists in the app root.")
+                        st.error(
+                            f"Lookup table '{active_lookup_path}' not found. Please upload one or ensure it exists in the app root."
+                        )
                     else:
                         weighted_cn, intersected_gdf = calculate_weighted_cn(
                             st.session_state["cn_aoi_gdf"],
@@ -1501,7 +1601,9 @@ with tab2:
                             active_lookup_path,
                         )
                         st.session_state["final_cn"] = weighted_cn
-                        st.session_state["cn_intersected_gdf"] = intersected_gdf
+                        st.session_state["cn_intersected_gdf"] = (
+                            intersected_gdf
+                        )
 
                         st.session_state["cn_zip_bytes"] = (
                             bundle_cn_project_zip_in_memory(
@@ -1516,11 +1618,8 @@ with tab2:
                 except Exception as e:
                     st.error(f"Calculation Error: {e}")
                 finally:
-                    # Clean up the temp lookup file if a user upload was generated
                     if temp_lookup_path and os.path.exists(temp_lookup_path):
                         os.remove(temp_lookup_path)
-                        
-    ############################
 
     if "nlcd_source_version" in st.session_state:
         st.info(
@@ -1546,8 +1645,6 @@ with tab2:
                     type="primary",
                 )
 
-    # st.markdown("---")
-    # st.subheader("Interactive Map Viewer")
     st.markdown("---")
     col_map_head, col_zoom_btn = st.columns([3, 1])
     with col_map_head:
@@ -1561,7 +1658,6 @@ with tab2:
         if zoom_cn_click and has_aoi:
             b = st.session_state["cn_aoi_gdf"].to_crs("EPSG:4326").total_bounds
             st.session_state["cn_zoom_bounds"] = [[b[1], b[0]], [b[3], b[2]]]
-    
 
     col_map_view, col_legends = st.columns([3, 1])
 
@@ -1580,7 +1676,6 @@ with tab2:
             location=start_loc, zoom_start=13, tiles="OpenStreetMap"
         )
 
-        # NLCD Land Cover Layer
         if has_nlcd:
             nlcd_4326 = (
                 st.session_state["cn_nlcd_gdf"].to_crs("EPSG:4326").copy()
@@ -1610,7 +1705,6 @@ with tab2:
                 ),
             ).add_to(m2)
 
-        # SSURGO Soil Groups Layer
         if has_ssurgo:
             ssurgo_4326 = (
                 st.session_state["cn_ssurgo_gdf"].to_crs("EPSG:4326").copy()
@@ -1645,21 +1739,6 @@ with tab2:
                 ),
             ).add_to(m2)
 
-        # Watershed Boundary Layer
-        # if has_aoi:
-        #     aoi_4326 = st.session_state["cn_aoi_gdf"].to_crs("EPSG:4326")
-        #     folium.GeoJson(
-        #         aoi_4326,
-        #         name="Watershed Boundary",
-        #         style_function=lambda x: {
-        #             "color": "red",
-        #             "fillOpacity": 0,
-        #             "weight": 3.5,
-        #         },
-        #     ).add_to(m2)
-        #     m2.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
-        
-        # Watershed Boundary Layer
         if has_aoi:
             aoi_4326 = st.session_state["cn_aoi_gdf"].to_crs("EPSG:4326")
             folium.GeoJson(
@@ -1679,10 +1758,11 @@ with tab2:
             m2.fit_bounds(st.session_state["cn_zoom_bounds"])
             st.session_state["cn_zoom_bounds"] = None
 
-        # Calculated CN Polygons Layer
         if has_cn:
             cn_4326 = (
-                st.session_state["cn_intersected_gdf"].to_crs("EPSG:4326").copy()
+                st.session_state["cn_intersected_gdf"]
+                .to_crs("EPSG:4326")
+                .copy()
             )
 
             folium.GeoJson(
