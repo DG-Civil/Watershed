@@ -216,16 +216,22 @@ def extract_uploaded_archive_in_temp(uploaded_file, extract_to):
                 return os.path.join(root, file)
     return None
 
-@st.cache_resource
+
 def get_wbt():
     import stat
+    import os
+    import requests
+    import zipfile
+    import whitebox
     
     # 1. Monkey-patch the download function to prevent writing to read-only site-packages
     whitebox.whitebox_tools.download_wbt = lambda *args, **kwargs: None
     
     # 2. Define the writable target directory in Streamlit Cloud
     wbt_dir = "/tmp/wbt_env"
-    wbt_bin_dir = os.path.join(wbt_dir, "WBT")
+    
+    # UPDATE: The zip extracts into a parent directory named 'WhiteboxTools_linux_amd64'
+    wbt_bin_dir = os.path.join(wbt_dir, "WhiteboxTools_linux_amd64", "WBT")
     exe_path = os.path.join(wbt_bin_dir, "whitebox_tools")
     
     # 3. Download and extract manually if it doesn't already exist
@@ -248,7 +254,6 @@ def get_wbt():
     wbt = whitebox.WhiteboxTools()
     wbt.set_whitebox_dir(wbt_bin_dir)
     return wbt
-
 
 # -----------------------------------------------------------------------------
 # APP INTERFACE
