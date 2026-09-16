@@ -216,6 +216,39 @@ def extract_uploaded_archive_in_temp(uploaded_file, extract_to):
                 return os.path.join(root, file)
     return None
 
+@st.cache_resource
+def get_wbt():
+    import stat
+    
+    # 1. Monkey-patch the download function to prevent writing to read-only site-packages
+    whitebox.whitebox_tools.download_wbt = lambda *args, **kwargs: None
+    
+    # 2. Define the writable target directory in Streamlit Cloud
+    wbt_dir = "/tmp/wbt_env"
+    wbt_bin_dir = os.path.join(wbt_dir, "WBT")
+    exe_path = os.path.join(wbt_bin_dir, "whitebox_tools")
+    
+    # 3. Download and extract manually if it doesn't already exist
+    if not os.path.exists(exe_path):
+        os.makedirs(wbt_dir, exist_ok=True)
+        url = "https://www.whiteboxgeo.com/WBT_Linux/WhiteboxTools_linux_amd64.zip"
+        zip_path = os.path.join(wbt_dir, "wbt.zip")
+        
+        response = requests.get(url, timeout=120)
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+            
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(wbt_dir)
+            
+        # Grant execution permissions to the binary
+        os.chmod(exe_path, os.stat(exe_path).st_mode | stat.S_IEXEC)
+        
+    # 4. Instantiate and override the working directory
+    wbt = whitebox.WhiteboxTools()
+    wbt.set_whitebox_dir(wbt_bin_dir)
+    return wbt
+
 
 # -----------------------------------------------------------------------------
 # APP INTERFACE
@@ -819,7 +852,7 @@ with tab1:
                 with st.spinner(
                     "Executing WhiteboxTools hydrology workflow..."
                 ):
-                    wbt = whitebox.WhiteboxTools()
+                    wbt = get_wbt()
                     wbt.set_verbose_mode(False)
 
                     filled_dem = os.path.join(work_dir, "filled_dem.tif")
