@@ -665,7 +665,8 @@ with tab1:
             g_min = st.session_state["global_min"]
             g_max = st.session_state["global_max"]
 
-            terrain_cmap = cm.get_cmap("terrain", 15)
+            #terrain_cmap = cm.get_cmap("terrain", 15)
+            terrain_cmap = mpl.colormaps['terrain'].resampled(15)
             hex_colors = [
                 mcolors.to_hex(terrain_cmap(i)) for i in np.linspace(0, 1, 15)
             ]
@@ -691,7 +692,9 @@ with tab1:
                             / (g_max - g_min)
                             * 255
                         ).clip(0, 255).astype(np.uint8)
-                        colored = cm.terrain(norm / 255.0) * 255
+                        
+                        colored = terrain_cmap(norm / 255.0) * 255
+                        #colored = cm.terrain(norm / 255.0) * 255
                         rgba_img = colored.astype(np.uint8)
 
                     rgba_img[..., 3] = np.where(dem["mask"], 160, 0)
