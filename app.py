@@ -98,13 +98,19 @@ US_STATES = [
 # HELPER & IN-MEMORY RASTER / REST FUNCTIONS
 # -----------------------------------------------------------------------------
 
+import ctypes
+
+
 def enforce_cloud_memory_limit(limit_mb=900):
-    """
-    Monitors Streamlit process RAM. If limit is exceeded, purges session state,
-    clears Streamlit caches, forces garbage collection, and stops execution.
-    """
-    # 1. Force GC sweep first to clear lingering unreferenced objects
+    # 1. Force Python garbage collection
     gc.collect()
+    
+    # 2. Force Linux to release C-extension memory arenas back to the OS
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
 
     parent = psutil.Process(os.getpid())
     processes = [parent] + parent.children(recursive=True)
@@ -128,16 +134,19 @@ def enforce_cloud_memory_limit(limit_mb=900):
     total_mb = total_bytes / (1024 * 1024)
 
     if total_mb > limit_mb:
-        # 2. Clear all session state keys to release heavy objects/buffers
+        # 3. Purge Streamlit session and caches to drop heavy references
         for key in list(st.session_state.keys()):
             del st.session_state[key]
-
-        # 3. Clear Streamlit internal function caches
+            
         st.cache_data.clear()
         st.cache_resource.clear()
 
-        # 4. Force aggressive Garbage Collection
+        # 4. Run GC and malloc_trim one more time after purging Streamlit data
         gc.collect()
+        try:
+            libc.malloc_trim(0)
+        except Exception:
+            pass
 
         breakdown_md = "\n".join(
             f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`): **{p['mem_mb']:.2f} MB**"
@@ -148,9 +157,75 @@ def enforce_cloud_memory_limit(limit_mb=900):
             f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
             f"Execution stopped to prevent a container crash. Active process usage:\n\n"
             f"{breakdown_md}\n\n"
-            f"🧹 **Session memory and caches have been purged.** Please refresh the page and try uploading smaller/fewer files."
+            f"🧹 **Session memory and caches have been purged.**"
         )
+        
+        st.warning("If a page refresh still results in this error, the memory is locked by the system. Click the button below to restart the container and clear the RAM entirely.")
+        
+        # 5. Provide a hard-reset escape hatch that guarantees 0 RAM usage
+        if st.button("🔄 Hard Reset Server Memory", type="primary"):
+            os._exit(0)
+            
         st.stop()
+
+
+
+
+
+
+# def enforce_cloud_memory_limit(limit_mb=900):
+#     """
+#     Monitors Streamlit process RAM. If limit is exceeded, purges session state,
+#     clears Streamlit caches, forces garbage collection, and stops execution.
+#     """
+#     # 1. Force GC sweep first to clear lingering unreferenced objects
+#     gc.collect()
+
+#     parent = psutil.Process(os.getpid())
+#     processes = [parent] + parent.children(recursive=True)
+    
+#     total_bytes = 0
+#     process_info = []
+
+#     for proc in processes:
+#         try:
+#             mem_bytes = proc.memory_info().rss
+#             total_bytes += mem_bytes
+#             process_info.append({
+#                 "role": "Parent" if proc.pid == parent.pid else "Child",
+#                 "name": proc.name(),
+#                 "pid": proc.pid,
+#                 "mem_mb": mem_bytes / (1024 * 1024)
+#             })
+#         except (psutil.NoSuchProcess, psutil.AccessDenied):
+#             continue
+
+#     total_mb = total_bytes / (1024 * 1024)
+
+#     if total_mb > limit_mb:
+#         # 2. Clear all session state keys to release heavy objects/buffers
+#         for key in list(st.session_state.keys()):
+#             del st.session_state[key]
+
+#         # 3. Clear Streamlit internal function caches
+#         st.cache_data.clear()
+#         st.cache_resource.clear()
+
+#         # 4. Force aggressive Garbage Collection
+#         gc.collect()
+
+#         breakdown_md = "\n".join(
+#             f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`): **{p['mem_mb']:.2f} MB**"
+#             for p in process_info
+#         )
+        
+#         st.error(
+#             f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
+#             f"Execution stopped to prevent a container crash. Active process usage:\n\n"
+#             f"{breakdown_md}\n\n"
+#             f"🧹 **Session memory and caches have been purged.** Please refresh the page and try uploading smaller/fewer files."
+#         )
+#         st.stop()
 
 RAM_limit=1100
 
