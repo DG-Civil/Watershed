@@ -35,6 +35,7 @@ import matplotlib as mpl
 
 import psutil
 
+
 st.set_page_config(
     page_title="Hydrology & CN Web Suite",
     page_icon="🌊",
@@ -282,6 +283,44 @@ def extract_uploaded_archive_in_temp(uploaded_file, extract_to):
                 return os.path.join(root, file)
     return None
 
+
+def get_wbt():
+    import stat
+    import os
+    import requests
+    import zipfile
+    import whitebox
+    
+    # 1. Monkey-patch the download function to prevent writing to read-only site-packages
+    whitebox.whitebox_tools.download_wbt = lambda *args, **kwargs: None
+    
+    # 2. Define the writable target directory in Streamlit Cloud
+    wbt_dir = "/tmp/wbt_env"
+    
+    # UPDATE: The zip extracts into a parent directory named 'WhiteboxTools_linux_amd64'
+    wbt_bin_dir = os.path.join(wbt_dir, "WhiteboxTools_linux_amd64", "WBT")
+    exe_path = os.path.join(wbt_bin_dir, "whitebox_tools")
+    
+    # 3. Download and extract manually if it doesn't already exist
+    if not os.path.exists(exe_path):
+        os.makedirs(wbt_dir, exist_ok=True)
+        url = "https://www.whiteboxgeo.com/WBT_Linux/WhiteboxTools_linux_amd64.zip"
+        zip_path = os.path.join(wbt_dir, "wbt.zip")
+        
+        response = requests.get(url, timeout=120)
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+            
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(wbt_dir)
+            
+        # Grant execution permissions to the binary
+        os.chmod(exe_path, os.stat(exe_path).st_mode | stat.S_IEXEC)
+        
+    # 4. Instantiate and override the working directory
+    wbt = whitebox.WhiteboxTools()
+    wbt.set_whitebox_dir(wbt_bin_dir)
+    return wbt
 
 # -----------------------------------------------------------------------------
 # APP INTERFACE
@@ -693,8 +732,8 @@ with tab1:
                             * 255
                         ).clip(0, 255).astype(np.uint8)
                         
-                        colored = terrain_cmap(norm / 255.0) * 255
                         #colored = cm.terrain(norm / 255.0) * 255
+                        colored = terrain_cmap(norm / 255.0) * 255
                         rgba_img = colored.astype(np.uint8)
 
                     rgba_img[..., 3] = np.where(dem["mask"], 160, 0)
@@ -889,7 +928,7 @@ with tab1:
                 with st.spinner(
                     "Executing WhiteboxTools hydrology workflow..."
                 ):
-                    wbt = whitebox.WhiteboxTools()
+                    wbt = get_wbt()
                     wbt.set_verbose_mode(False)
 
                     filled_dem = os.path.join(work_dir, "filled_dem.tif")
@@ -1019,36 +1058,18 @@ with tab1:
                     )
                     st.session_state["aoi_gdf"] = watershed_gdf
 
-                    # stream_clipped_path = os.path.join(
-                    #     work_dir, "streams_clipped.shp"
-                    # )
-                    # if os.path.exists(streams_vector):
-                    #     streams_raw_gdf = gpd.read_file(
-                    #         streams_vector
-                    #     ).set_crs(target_crs)
-                    #     stream_clipped_gdf = gpd.clip(
-                    #         streams_raw_gdf, watershed_gdf
-                    #     )
-                    #     st.session_state["stream_gdf"] = stream_clipped_gdf
-                    #     stream_clipped_gdf.to_file(stream_clipped_path)
-                    
-                    stream_clipped_path = os.path.join(work_dir, "streams_clipped.shp")
+                    stream_clipped_path = os.path.join(
+                        work_dir, "streams_clipped.shp"
+                    )
                     if os.path.exists(streams_vector):
-                        streams_raw_gdf = gpd.read_file(streams_vector).set_crs(target_crs)
-                        clipped_gdf = gpd.clip(streams_raw_gdf, watershed_gdf)
-                    
-                        # Filter out point/multipoint artifacts resulting from boundary intersections
-                        stream_clipped_gdf = clipped_gdf[
-                            clipped_gdf.geometry.type.isin(["LineString", "MultiLineString"])
-                        ].copy()
-                    
-                        if not stream_clipped_gdf.empty:
-                            st.session_state["stream_gdf"] = stream_clipped_gdf
-                            stream_clipped_gdf.to_file(stream_clipped_path)
-                        else:
-                            st.session_state.pop("stream_gdf", None)
-                            
-                            
+                        streams_raw_gdf = gpd.read_file(
+                            streams_vector
+                        ).set_crs(target_crs)
+                        stream_clipped_gdf = gpd.clip(
+                            streams_raw_gdf, watershed_gdf
+                        )
+                        st.session_state["stream_gdf"] = stream_clipped_gdf
+                        stream_clipped_gdf.to_file(stream_clipped_path)
 
                     flowpath_shp = os.path.join(
                         work_dir, "longest_flowpath.shp"
@@ -1385,7 +1406,6 @@ def calculate_weighted_cn(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
     nlcd_clipped["land_use_clean"] = (
         nlcd_clipped["land_use"].astype(str).str.strip().str.split(".").str[0]
     )
-
 
     ssurgo_grouped = (
         ssurgo_clipped[["hyg_clean", "geometry"]]
