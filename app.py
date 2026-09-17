@@ -31,7 +31,7 @@ from rasterio.windows import Window
 from scipy.interpolate import griddata
 from shapely.geometry import box
 from streamlit_folium import st_folium
-
+import matplotlib as mpl
 
 import psutil
 
