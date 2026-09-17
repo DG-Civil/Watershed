@@ -100,14 +100,17 @@ US_STATES = [
 
 def enforce_cloud_memory_limit(limit_mb=900):
     """
-    Monitors Streamlit RAM usage and displays a detailed process breakdown 
-    (parent + children) if memory consumption crosses the safety limit.
+    Monitors Streamlit process RAM. If limit is exceeded, purges session state,
+    clears Streamlit caches, forces garbage collection, and stops execution.
     """
+    # 1. Force GC sweep first to clear lingering unreferenced objects
+    gc.collect()
+
     parent = psutil.Process(os.getpid())
     processes = [parent] + parent.children(recursive=True)
     
-    process_info = []
     total_bytes = 0
+    process_info = []
 
     for proc in processes:
         try:
@@ -120,13 +123,22 @@ def enforce_cloud_memory_limit(limit_mb=900):
                 "mem_mb": mem_bytes / (1024 * 1024)
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            # Handles edge cases where a subprocess terminates mid-check
             continue
 
     total_mb = total_bytes / (1024 * 1024)
 
     if total_mb > limit_mb:
-        # Construct breakdown list for the Streamlit UI
+        # 2. Clear all session state keys to release heavy objects/buffers
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+
+        # 3. Clear Streamlit internal function caches
+        st.cache_data.clear()
+        st.cache_resource.clear()
+
+        # 4. Force aggressive Garbage Collection
+        gc.collect()
+
         breakdown_md = "\n".join(
             f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`): **{p['mem_mb']:.2f} MB**"
             for p in process_info
@@ -134,11 +146,56 @@ def enforce_cloud_memory_limit(limit_mb=900):
         
         st.error(
             f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
-            f"Execution stopped to prevent a container OOM reboot. Active process consumption:\n\n"
+            f"Execution stopped to prevent a container crash. Active process usage:\n\n"
             f"{breakdown_md}\n\n"
-            f"Please refresh the app and use smaller datasets or reduce concurrent operations."
+            f"🧹 **Session memory and caches have been purged.** Please refresh the page and try uploading smaller/fewer files."
         )
         st.stop()
+
+RAM_limit=1100
+
+
+# def enforce_cloud_memory_limit(limit_mb=900):
+#     """
+#     Monitors Streamlit RAM usage and displays a detailed process breakdown 
+#     (parent + children) if memory consumption crosses the safety limit.
+#     """
+#     parent = psutil.Process(os.getpid())
+#     processes = [parent] + parent.children(recursive=True)
+    
+#     process_info = []
+#     total_bytes = 0
+
+#     for proc in processes:
+#         try:
+#             mem_bytes = proc.memory_info().rss
+#             total_bytes += mem_bytes
+#             process_info.append({
+#                 "role": "Parent" if proc.pid == parent.pid else "Child",
+#                 "name": proc.name(),
+#                 "pid": proc.pid,
+#                 "mem_mb": mem_bytes / (1024 * 1024)
+#             })
+#         except (psutil.NoSuchProcess, psutil.AccessDenied):
+#             # Handles edge cases where a subprocess terminates mid-check
+#             continue
+
+#     total_mb = total_bytes / (1024 * 1024)
+
+#     if total_mb > limit_mb:
+#         # Construct breakdown list for the Streamlit UI
+#         breakdown_md = "\n".join(
+#             f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`): **{p['mem_mb']:.2f} MB**"
+#             for p in process_info
+#         )
+        
+#         st.error(
+#             f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
+#             f"Execution stopped to prevent a container OOM reboot. Active process consumption:\n\n"
+#             f"{breakdown_md}\n\n"
+#             f"Please refresh the app and use smaller datasets or reduce concurrent operations."
+#         )
+#         st.stop()
 
 # def enforce_cloud_memory_limit(limit_mb=900):
 #     """
@@ -161,8 +218,9 @@ def enforce_cloud_memory_limit(limit_mb=900):
 #         )
 #         st.stop()
 
-RAM_limit=1100
+# RAM_limit=1100
 
+@st.cache_data(ttl=120,  show_spinner=False)
 def parse_landxml_to_geotiff(xml_input, output_tif_path, res=2.0):
     """Parses LandXML from path or buffer and writes geotiff to a scoped path."""
     tree = ET.parse(xml_input)
@@ -220,7 +278,7 @@ def parse_landxml_to_geotiff(xml_input, output_tif_path, res=2.0):
 
     return output_tif_path
 
-
+#@st.cache_data(ttl=120,  show_spinner=False)
 def fetch_texas_streams_rest(target_crs, native_bounds):
     """
     Queries TxGIO ArcGIS REST service (NHD_TX_Rivers_Streams, Layer 1) 
@@ -272,6 +330,7 @@ def fetch_texas_streams_rest(target_crs, native_bounds):
 
     return gdf.to_crs(target_crs)
 
+@st.cache_data(ttl=120,  show_spinner=False)
 def extract_uploaded_archive_in_temp(uploaded_file, extract_to):
     """Extracts uploaded zip archive into target temp directory."""
     zip_bytes = io.BytesIO(uploaded_file.getbuffer())
@@ -283,7 +342,7 @@ def extract_uploaded_archive_in_temp(uploaded_file, extract_to):
                 return os.path.join(root, file)
     return None
 
-
+@st.cache_data(ttl=120,  show_spinner=False)
 def get_wbt():
     import stat
     import os
@@ -1058,18 +1117,36 @@ with tab1:
                     )
                     st.session_state["aoi_gdf"] = watershed_gdf
 
-                    stream_clipped_path = os.path.join(
-                        work_dir, "streams_clipped.shp"
-                    )
+                    # stream_clipped_path = os.path.join(
+                    #     work_dir, "streams_clipped.shp"
+                    # )
+                    
+                    # if os.path.exists(streams_vector):
+                    #     streams_raw_gdf = gpd.read_file(
+                    #         streams_vector
+                    #     ).set_crs(target_crs)
+                    #     stream_clipped_gdf = gpd.clip(
+                    #         streams_raw_gdf, watershed_gdf
+                    #     )
+                    #     st.session_state["stream_gdf"] = stream_clipped_gdf
+                    #     stream_clipped_gdf.to_file(stream_clipped_path)
+                    
+                    stream_clipped_path = os.path.join(work_dir, "streams_clipped.shp")
                     if os.path.exists(streams_vector):
-                        streams_raw_gdf = gpd.read_file(
-                            streams_vector
-                        ).set_crs(target_crs)
-                        stream_clipped_gdf = gpd.clip(
-                            streams_raw_gdf, watershed_gdf
-                        )
-                        st.session_state["stream_gdf"] = stream_clipped_gdf
-                        stream_clipped_gdf.to_file(stream_clipped_path)
+                        streams_raw_gdf = gpd.read_file(streams_vector).set_crs(target_crs)
+                        clipped_gdf = gpd.clip(streams_raw_gdf, watershed_gdf)
+                    
+                        # Filter out point/multipoint artifacts resulting from boundary intersections
+                        stream_clipped_gdf = clipped_gdf[
+                            clipped_gdf.geometry.type.isin(["LineString", "MultiLineString"])
+                        ].copy()
+                    
+                        if not stream_clipped_gdf.empty:
+                            st.session_state["stream_gdf"] = stream_clipped_gdf
+                            stream_clipped_gdf.to_file(stream_clipped_path)
+                        else:
+                            st.session_state.pop("stream_gdf", None)
+
 
                     flowpath_shp = os.path.join(
                         work_dir, "longest_flowpath.shp"
@@ -1204,7 +1281,7 @@ with tab1:
 # TAB 2: SSURGO & NLCD CN GENERATOR
 # -----------------------------------------------------------------------------
 
-
+@st.cache_data(ttl=120,  show_spinner=False)
 def extract_local_nlcd_windowed(src, aoi_proj):
     xmin, ymin, xmax, ymax = aoi_proj.total_bounds
     win = src.window(xmin, ymin, xmax, ymax)
@@ -1250,7 +1327,7 @@ def extract_local_nlcd_windowed(src, aoi_proj):
 
     return nlcd_gdf
 
-
+@st.cache_data(ttl=120,  show_spinner=False)
 def fetch_nlcd_dataset(aoi_gdf):
     """Downloads NLCD 2021 data dynamically via MRLC WCS based on AOI bounds."""
     aoi_5070 = aoi_gdf.to_crs("EPSG:5070")
@@ -1292,7 +1369,7 @@ def fetch_nlcd_dataset(aoi_gdf):
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-
+@st.cache_data(ttl=120,  show_spinner=False)
 def fetch_local_nlcd_2025(aoi_gdf, state_name, nlcd_year):
     """Loads NLCD land cover data from local NLCD/<year>/<state>.tif file."""
     year_str = str(nlcd_year)
@@ -1317,7 +1394,7 @@ def fetch_local_nlcd_2025(aoi_gdf, state_name, nlcd_year):
         nlcd_gdf = extract_local_nlcd_windowed(src, aoi_proj)
         return nlcd_gdf, f"Local NLCD {nlcd_year} Dataset ({state_name})"
 
-
+@st.cache_data(ttl=120,  show_spinner=False)
 def download_ssurgo_extended(aoi_gdf):
     """Downloads SSURGO data via WFS directly into RAM buffer."""
     aoi_4326 = aoi_gdf.to_crs("EPSG:4326")
@@ -1372,7 +1449,7 @@ def clean_hsg(val):
         return parts[-1] if parts else ""
     return val_str
 
-
+@st.cache_data(ttl=120,  show_spinner=False)
 def calculate_weighted_cn(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
     target_crs = (
         aoi_gdf.crs
