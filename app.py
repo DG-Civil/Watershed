@@ -31,7 +31,9 @@ from rasterio.windows import Window
 from scipy.interpolate import griddata
 from shapely.geometry import box
 from streamlit_folium import st_folium
-import matplotlib as mpl
+
+
+import psutil
 
 st.set_page_config(
     page_title="Hydrology & CN Web Suite",
@@ -95,6 +97,70 @@ US_STATES = [
 # HELPER & IN-MEMORY RASTER / REST FUNCTIONS
 # -----------------------------------------------------------------------------
 
+def enforce_cloud_memory_limit(limit_mb=900):
+    """
+    Monitors Streamlit RAM usage and displays a detailed process breakdown 
+    (parent + children) if memory consumption crosses the safety limit.
+    """
+    parent = psutil.Process(os.getpid())
+    processes = [parent] + parent.children(recursive=True)
+    
+    process_info = []
+    total_bytes = 0
+
+    for proc in processes:
+        try:
+            mem_bytes = proc.memory_info().rss
+            total_bytes += mem_bytes
+            process_info.append({
+                "role": "Parent" if proc.pid == parent.pid else "Child",
+                "name": proc.name(),
+                "pid": proc.pid,
+                "mem_mb": mem_bytes / (1024 * 1024)
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Handles edge cases where a subprocess terminates mid-check
+            continue
+
+    total_mb = total_bytes / (1024 * 1024)
+
+    if total_mb > limit_mb:
+        # Construct breakdown list for the Streamlit UI
+        breakdown_md = "\n".join(
+            f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`): **{p['mem_mb']:.2f} MB**"
+            for p in process_info
+        )
+        
+        st.error(
+            f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
+            f"Execution stopped to prevent a container OOM reboot. Active process consumption:\n\n"
+            f"{breakdown_md}\n\n"
+            f"Please refresh the app and use smaller datasets or reduce concurrent operations."
+        )
+        st.stop()
+
+# def enforce_cloud_memory_limit(limit_mb=900):
+#     """
+#     Monitors process RAM on Streamlit Community Cloud.
+#     Stops execution before reaching the ~1 GB container OOM threshold.
+#     """
+#     parent = psutil.Process(os.getpid())
+    
+#     # Calculate memory of main Streamlit process + any spawned sub-processes
+#     total_bytes = parent.memory_info().rss + sum(
+#         child.memory_info().rss for child in parent.children(recursive=True)
+#     )
+#     mem_mb = total_bytes / (1024 * 1024)
+
+#     if mem_mb > limit_mb:
+#         st.error(
+#             f"⚠️ **Memory Limit Reached ({mem_mb:.1f} MB / {limit_mb} MB):** "
+#             "To prevent the server from crashing, execution was stopped. "
+#             "Please clear your inputs or upload a smaller file."
+#         )
+#         st.stop()
+
+RAM_limit=1100
 
 def parse_landxml_to_geotiff(xml_input, output_tif_path, res=2.0):
     """Parses LandXML from path or buffer and writes geotiff to a scoped path."""
@@ -216,44 +282,6 @@ def extract_uploaded_archive_in_temp(uploaded_file, extract_to):
                 return os.path.join(root, file)
     return None
 
-
-def get_wbt():
-    import stat
-    import os
-    import requests
-    import zipfile
-    import whitebox
-    
-    # 1. Monkey-patch the download function to prevent writing to read-only site-packages
-    whitebox.whitebox_tools.download_wbt = lambda *args, **kwargs: None
-    
-    # 2. Define the writable target directory in Streamlit Cloud
-    wbt_dir = "/tmp/wbt_env"
-    
-    # UPDATE: The zip extracts into a parent directory named 'WhiteboxTools_linux_amd64'
-    wbt_bin_dir = os.path.join(wbt_dir, "WhiteboxTools_linux_amd64", "WBT")
-    exe_path = os.path.join(wbt_bin_dir, "whitebox_tools")
-    
-    # 3. Download and extract manually if it doesn't already exist
-    if not os.path.exists(exe_path):
-        os.makedirs(wbt_dir, exist_ok=True)
-        url = "https://www.whiteboxgeo.com/WBT_Linux/WhiteboxTools_linux_amd64.zip"
-        zip_path = os.path.join(wbt_dir, "wbt.zip")
-        
-        response = requests.get(url, timeout=120)
-        with open(zip_path, "wb") as f:
-            f.write(response.content)
-            
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(wbt_dir)
-            
-        # Grant execution permissions to the binary
-        os.chmod(exe_path, os.stat(exe_path).st_mode | stat.S_IEXEC)
-        
-    # 4. Instantiate and override the working directory
-    wbt = whitebox.WhiteboxTools()
-    wbt.set_whitebox_dir(wbt_bin_dir)
-    return wbt
 
 # -----------------------------------------------------------------------------
 # APP INTERFACE
@@ -430,6 +458,8 @@ with tab1:
                                 destination = np.zeros(
                                     (dst_height, dst_width), dtype=np.float32
                                 )
+                                
+                                enforce_cloud_memory_limit(RAM_limit)
 
                                 reproject(
                                     source=rasterio.band(src, 1),
@@ -440,6 +470,8 @@ with tab1:
                                     dst_crs=dst_crs,
                                     resampling=Resampling.average,
                                 )
+                                
+                                enforce_cloud_memory_limit(RAM_limit)
 
                                 valid_mask = ~np.isnan(destination)
                                 if src.nodata is not None:
@@ -633,8 +665,7 @@ with tab1:
             g_min = st.session_state["global_min"]
             g_max = st.session_state["global_max"]
 
-            #terrain_cmap = cm.get_cmap("terrain", 15)
-            terrain_cmap = mpl.colormaps['terrain'].resampled(15)
+            terrain_cmap = cm.get_cmap("terrain", 15)
             hex_colors = [
                 mcolors.to_hex(terrain_cmap(i)) for i in np.linspace(0, 1, 15)
             ]
@@ -660,9 +691,7 @@ with tab1:
                             / (g_max - g_min)
                             * 255
                         ).clip(0, 255).astype(np.uint8)
-                        
-                        #colored = cm.terrain(norm / 255.0) * 255
-                        colored = terrain_cmap(norm / 255.0) * 255
+                        colored = cm.terrain(norm / 255.0) * 255
                         rgba_img = colored.astype(np.uint8)
 
                     rgba_img[..., 3] = np.where(dem["mask"], 160, 0)
@@ -857,7 +886,7 @@ with tab1:
                 with st.spinner(
                     "Executing WhiteboxTools hydrology workflow..."
                 ):
-                    wbt = get_wbt()
+                    wbt = whitebox.WhiteboxTools()
                     wbt.set_verbose_mode(False)
 
                     filled_dem = os.path.join(work_dir, "filled_dem.tif")
@@ -958,12 +987,18 @@ with tab1:
 
                     with rasterio.open(watershed_raster) as src_ws:
                         ws_data = src_ws.read(1)
+                        
+                        enforce_cloud_memory_limit(RAM_limit)
+                        
                         ws_pixel_count = np.sum(ws_data > 0)
                         shapes_gen = rasterio.features.shapes(
                             ws_data,
                             mask=(ws_data > 0),
                             transform=src_ws.transform,
                         )
+                        
+                        enforce_cloud_memory_limit(RAM_limit)
+                        
                         ws_geoms = [
                             sg.shape(s) for s, v in shapes_gen if v > 0
                         ]
@@ -981,18 +1016,36 @@ with tab1:
                     )
                     st.session_state["aoi_gdf"] = watershed_gdf
 
-                    stream_clipped_path = os.path.join(
-                        work_dir, "streams_clipped.shp"
-                    )
+                    # stream_clipped_path = os.path.join(
+                    #     work_dir, "streams_clipped.shp"
+                    # )
+                    # if os.path.exists(streams_vector):
+                    #     streams_raw_gdf = gpd.read_file(
+                    #         streams_vector
+                    #     ).set_crs(target_crs)
+                    #     stream_clipped_gdf = gpd.clip(
+                    #         streams_raw_gdf, watershed_gdf
+                    #     )
+                    #     st.session_state["stream_gdf"] = stream_clipped_gdf
+                    #     stream_clipped_gdf.to_file(stream_clipped_path)
+                    
+                    stream_clipped_path = os.path.join(work_dir, "streams_clipped.shp")
                     if os.path.exists(streams_vector):
-                        streams_raw_gdf = gpd.read_file(
-                            streams_vector
-                        ).set_crs(target_crs)
-                        stream_clipped_gdf = gpd.clip(
-                            streams_raw_gdf, watershed_gdf
-                        )
-                        st.session_state["stream_gdf"] = stream_clipped_gdf
-                        stream_clipped_gdf.to_file(stream_clipped_path)
+                        streams_raw_gdf = gpd.read_file(streams_vector).set_crs(target_crs)
+                        clipped_gdf = gpd.clip(streams_raw_gdf, watershed_gdf)
+                    
+                        # Filter out point/multipoint artifacts resulting from boundary intersections
+                        stream_clipped_gdf = clipped_gdf[
+                            clipped_gdf.geometry.type.isin(["LineString", "MultiLineString"])
+                        ].copy()
+                    
+                        if not stream_clipped_gdf.empty:
+                            st.session_state["stream_gdf"] = stream_clipped_gdf
+                            stream_clipped_gdf.to_file(stream_clipped_path)
+                        else:
+                            st.session_state.pop("stream_gdf", None)
+                            
+                            
 
                     flowpath_shp = os.path.join(
                         work_dir, "longest_flowpath.shp"
@@ -1330,6 +1383,7 @@ def calculate_weighted_cn(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
         nlcd_clipped["land_use"].astype(str).str.strip().str.split(".").str[0]
     )
 
+
     ssurgo_grouped = (
         ssurgo_clipped[["hyg_clean", "geometry"]]
         .dissolve(by="hyg_clean")
@@ -1340,10 +1394,14 @@ def calculate_weighted_cn(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
         .dissolve(by="land_use_clean")
         .reset_index()
     )
+    
+    enforce_cloud_memory_limit(RAM_limit)
 
     final_intersect = gpd.overlay(
         ssurgo_grouped, nlcd_grouped, how="intersection"
     )
+    
+    enforce_cloud_memory_limit(RAM_limit)
 
     if final_intersect.empty:
         raise ValueError("Spatial intersection yielded empty geometry.")
