@@ -14,3 +14,4 @@ shapely
 streamlit
 streamlit-folium
 whitebox
+psutil
