@@ -101,7 +101,6 @@ US_STATES = [
 import ctypes
 
 
-
 def enforce_cloud_memory_limit(limit_mb=900):
   # 1. Force Python garbage collection
   gc.collect()
@@ -152,23 +151,97 @@ def enforce_cloud_memory_limit(limit_mb=900):
         " restart the application state."
     )
 
-    # 3. Soft reset: Purge memory references and reload Streamlit state
-    if st.button("🔄 Purge Memory & Reload Session", type="primary"):
+    # Definining a safe callback keeps Streamlit from breaking on initial boot
+    def purge_callback():
       st.session_state.clear()
       st.cache_data.clear()
       st.cache_resource.clear()
-
       gc.collect()
       try:
         libc.malloc_trim(0)
       except Exception:
         pass
 
-      st.rerun()
+    # Using on_click ensures this logic ONLY fires when a real user clicks it
+    st.button(
+        "🔄 Purge Memory & Reload Session",
+        type="primary",
+        on_click=purge_callback,
+    )
 
     st.stop()
 
-RAM_limit=1100
+
+RAM_limit = 1100
+
+
+# def enforce_cloud_memory_limit(limit_mb=900):
+#   # 1. Force Python garbage collection
+#   gc.collect()
+
+#   # 2. Force Linux to release C-extension memory arenas back to the OS
+#   try:
+#     libc = ctypes.CDLL("libc.so.6")
+#     libc.malloc_trim(0)
+#   except Exception:
+#     pass
+
+#   parent = psutil.Process(os.getpid())
+#   processes = [parent] + parent.children(recursive=True)
+
+#   total_bytes = 0
+#   process_info = []
+
+#   for proc in processes:
+#     try:
+#       mem_bytes = proc.memory_info().rss
+#       total_bytes += mem_bytes
+#       process_info.append({
+#           "role": "Parent" if proc.pid == parent.pid else "Child",
+#           "name": proc.name(),
+#           "pid": proc.pid,
+#           "mem_mb": mem_bytes / (1024 * 1024),
+#       })
+#     except (psutil.NoSuchProcess, psutil.AccessDenied):
+#       continue
+
+#   total_mb = total_bytes / (1024 * 1024)
+
+#   if total_mb > limit_mb:
+#     breakdown_md = "\n".join(
+#         f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`):"
+#         f" **{p['mem_mb']:.2f} MB**"
+#         for p in process_info
+#     )
+
+#     st.error(
+#         f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
+#         f"Execution stopped to prevent a container crash. Active process"
+#         f" usage:\n\n{breakdown_md}"
+#     )
+
+#     st.warning(
+#         "Click the button below to purge active session memory and safely"
+#         " restart the application state."
+#     )
+
+#     # 3. Soft reset: Purge memory references and reload Streamlit state
+#     if st.button("🔄 Purge Memory & Reload Session", type="primary"):
+#       st.session_state.clear()
+#       st.cache_data.clear()
+#       st.cache_resource.clear()
+
+#       gc.collect()
+#       try:
+#         libc.malloc_trim(0)
+#       except Exception:
+#         pass
+
+#       st.rerun()
+
+#     st.stop()
+
+# RAM_limit=1100
 
 
 # def enforce_cloud_memory_limit(limit_mb=900):
