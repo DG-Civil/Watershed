@@ -101,72 +101,142 @@ US_STATES = [
 import ctypes
 
 
+
 def enforce_cloud_memory_limit(limit_mb=900):
-    # 1. Force Python garbage collection
-    gc.collect()
-    
-    # 2. Force Linux to release C-extension memory arenas back to the OS
+  # 1. Force Python garbage collection
+  gc.collect()
+
+  # 2. Force Linux to release C-extension memory arenas back to the OS
+  try:
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+  except Exception:
+    pass
+
+  parent = psutil.Process(os.getpid())
+  processes = [parent] + parent.children(recursive=True)
+
+  total_bytes = 0
+  process_info = []
+
+  for proc in processes:
     try:
-        libc = ctypes.CDLL("libc.so.6")
+      mem_bytes = proc.memory_info().rss
+      total_bytes += mem_bytes
+      process_info.append({
+          "role": "Parent" if proc.pid == parent.pid else "Child",
+          "name": proc.name(),
+          "pid": proc.pid,
+          "mem_mb": mem_bytes / (1024 * 1024),
+      })
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+      continue
+
+  total_mb = total_bytes / (1024 * 1024)
+
+  if total_mb > limit_mb:
+    breakdown_md = "\n".join(
+        f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`):"
+        f" **{p['mem_mb']:.2f} MB**"
+        for p in process_info
+    )
+
+    st.error(
+        f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
+        f"Execution stopped to prevent a container crash. Active process"
+        f" usage:\n\n{breakdown_md}"
+    )
+
+    st.warning(
+        "Click the button below to purge active session memory and safely"
+        " restart the application state."
+    )
+
+    # 3. Soft reset: Purge memory references and reload Streamlit state
+    if st.button("🔄 Purge Memory & Reload Session", type="primary"):
+      st.session_state.clear()
+      st.cache_data.clear()
+      st.cache_resource.clear()
+
+      gc.collect()
+      try:
         libc.malloc_trim(0)
-    except Exception:
+      except Exception:
         pass
 
-    parent = psutil.Process(os.getpid())
-    processes = [parent] + parent.children(recursive=True)
+      st.rerun()
+
+    st.stop()
+
+RAM_limit=1100
+
+
+# def enforce_cloud_memory_limit(limit_mb=900):
+#     # 1. Force Python garbage collection
+#     gc.collect()
     
-    total_bytes = 0
-    process_info = []
+#     # 2. Force Linux to release C-extension memory arenas back to the OS
+#     try:
+#         libc = ctypes.CDLL("libc.so.6")
+#         libc.malloc_trim(0)
+#     except Exception:
+#         pass
 
-    for proc in processes:
-        try:
-            mem_bytes = proc.memory_info().rss
-            total_bytes += mem_bytes
-            process_info.append({
-                "role": "Parent" if proc.pid == parent.pid else "Child",
-                "name": proc.name(),
-                "pid": proc.pid,
-                "mem_mb": mem_bytes / (1024 * 1024)
-            })
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+#     parent = psutil.Process(os.getpid())
+#     processes = [parent] + parent.children(recursive=True)
+    
+#     total_bytes = 0
+#     process_info = []
 
-    total_mb = total_bytes / (1024 * 1024)
+#     for proc in processes:
+#         try:
+#             mem_bytes = proc.memory_info().rss
+#             total_bytes += mem_bytes
+#             process_info.append({
+#                 "role": "Parent" if proc.pid == parent.pid else "Child",
+#                 "name": proc.name(),
+#                 "pid": proc.pid,
+#                 "mem_mb": mem_bytes / (1024 * 1024)
+#             })
+#         except (psutil.NoSuchProcess, psutil.AccessDenied):
+#             continue
 
-    if total_mb > limit_mb:
-        # 3. Purge Streamlit session and caches to drop heavy references
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
+#     total_mb = total_bytes / (1024 * 1024)
+
+#     if total_mb > limit_mb:
+#         # 3. Purge Streamlit session and caches to drop heavy references
+#         for key in list(st.session_state.keys()):
+#             del st.session_state[key]
             
-        st.cache_data.clear()
-        st.cache_resource.clear()
+#         st.cache_data.clear()
+#         st.cache_resource.clear()
 
-        # 4. Run GC and malloc_trim one more time after purging Streamlit data
-        gc.collect()
-        try:
-            libc.malloc_trim(0)
-        except Exception:
-            pass
+#         # 4. Run GC and malloc_trim one more time after purging Streamlit data
+#         gc.collect()
+#         try:
+#             libc.malloc_trim(0)
+#         except Exception:
+#             pass
 
-        breakdown_md = "\n".join(
-            f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`): **{p['mem_mb']:.2f} MB**"
-            for p in process_info
-        )
+#         breakdown_md = "\n".join(
+#             f"* **{p['role']} Process** (`{p['name']}` | PID `{p['pid']}`): **{p['mem_mb']:.2f} MB**"
+#             for p in process_info
+#         )
         
-        st.error(
-            f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
-            f"Execution stopped to prevent a container crash. Active process usage:\n\n"
-            f"{breakdown_md}\n\n"
-            f"🧹 **Session memory and caches have been purged.**"
-        )
+#         st.error(
+#             f"⚠️ **Memory Limit Exceeded ({total_mb:.1f} MB / {limit_mb} MB)**\n\n"
+#             f"Execution stopped to prevent a container crash. Active process usage:\n\n"
+#             f"{breakdown_md}\n\n"
+#             f"🧹 **Session memory and caches have been purged.**"
+#         )
         
-        st.warning("If a page refresh still results in this error, the memory is locked by the system. Click the button below to restart the container and clear the RAM entirely.")
+#         st.warning("If a page refresh still results in this error, the memory is locked by the system. Click the button below to restart the container and clear the RAM entirely.")
         
-        # 5. Provide a hard-reset escape hatch that guarantees 0 RAM usage
-        if st.button("🔄 Hard Reset Server Memory", type="primary"):
-            os._exit(0)
+#         # 5. Provide a hard-reset escape hatch that guarantees 0 RAM usage
+#         if st.button("🔄 Hard Reset Server Memory", type="primary"):
+#             os._exit(0)
             
-        st.stop()
+#         st.stop()
 
 
 
@@ -227,7 +297,7 @@ def enforce_cloud_memory_limit(limit_mb=900):
 #         )
 #         st.stop()
 
-RAM_limit=1100
+
 
 
 # def enforce_cloud_memory_limit(limit_mb=900):
@@ -295,7 +365,7 @@ RAM_limit=1100
 
 # RAM_limit=1100
 
-@st.cache_data(ttl=120,  show_spinner=False)
+#@st.cache_data(ttl=120,  show_spinner=False)
 def parse_landxml_to_geotiff(xml_input, output_tif_path, res=2.0):
     """Parses LandXML from path or buffer and writes geotiff to a scoped path."""
     tree = ET.parse(xml_input)
@@ -1356,7 +1426,7 @@ with tab1:
 # TAB 2: SSURGO & NLCD CN GENERATOR
 # -----------------------------------------------------------------------------
 
-@st.cache_data(ttl=120,  show_spinner=False)
+#@st.cache_data(ttl=120,  show_spinner=False)
 def extract_local_nlcd_windowed(src, aoi_proj):
     xmin, ymin, xmax, ymax = aoi_proj.total_bounds
     win = src.window(xmin, ymin, xmax, ymax)
@@ -1402,7 +1472,7 @@ def extract_local_nlcd_windowed(src, aoi_proj):
 
     return nlcd_gdf
 
-@st.cache_data(ttl=120,  show_spinner=False)
+#@st.cache_data(ttl=120,  show_spinner=False)
 def fetch_nlcd_dataset(aoi_gdf):
     """Downloads NLCD 2021 data dynamically via MRLC WCS based on AOI bounds."""
     aoi_5070 = aoi_gdf.to_crs("EPSG:5070")
@@ -1444,7 +1514,7 @@ def fetch_nlcd_dataset(aoi_gdf):
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-@st.cache_data(ttl=120,  show_spinner=False)
+#@st.cache_data(ttl=120,  show_spinner=False)
 def fetch_local_nlcd_2025(aoi_gdf, state_name, nlcd_year):
     """Loads NLCD land cover data from local NLCD/<year>/<state>.tif file."""
     year_str = str(nlcd_year)
@@ -1469,7 +1539,7 @@ def fetch_local_nlcd_2025(aoi_gdf, state_name, nlcd_year):
         nlcd_gdf = extract_local_nlcd_windowed(src, aoi_proj)
         return nlcd_gdf, f"Local NLCD {nlcd_year} Dataset ({state_name})"
 
-@st.cache_data(ttl=120,  show_spinner=False)
+#@st.cache_data(ttl=120,  show_spinner=False)
 def download_ssurgo_extended(aoi_gdf):
     """Downloads SSURGO data via WFS directly into RAM buffer."""
     aoi_4326 = aoi_gdf.to_crs("EPSG:4326")
@@ -1524,7 +1594,7 @@ def clean_hsg(val):
         return parts[-1] if parts else ""
     return val_str
 
-@st.cache_data(ttl=120,  show_spinner=False)
+#@st.cache_data(ttl=120,  show_spinner=False)
 def calculate_weighted_cn(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
     target_crs = (
         aoi_gdf.crs
