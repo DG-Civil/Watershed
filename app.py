@@ -1759,6 +1759,110 @@ def calculate_weighted_cn(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
     return weighted_cn, merged
 
 
+def calculate_weighted_cn_and_c(
+    aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path
+):
+    target_crs = (
+        aoi_gdf.crs
+        if (aoi_gdf.crs and aoi_gdf.crs.is_projected)
+        else "EPSG:5070"
+    )
+
+    aoi_proj = aoi_gdf.to_crs(target_crs)
+    nlcd_proj = nlcd_gdf.to_crs(target_crs)
+    ssurgo_proj = ssurgo_gdf.to_crs(target_crs)
+
+    ssurgo_clipped = gpd.clip(ssurgo_proj, aoi_proj)
+    nlcd_clipped = gpd.clip(nlcd_proj, aoi_proj)
+
+    if ssurgo_clipped.empty or nlcd_clipped.empty:
+        raise ValueError(
+            "SSURGO or NLCD dataset returned empty geometry when clipped."
+        )
+
+    hyg_col = next(
+        (
+            c
+            for c in ssurgo_clipped.columns
+            if c.lower() in ["hydgrpdcd", "hydgrp", "hyg"]
+        ),
+        None,
+    )
+    ssurgo_clipped["hyg_clean"] = (
+        ssurgo_clipped[hyg_col].apply(clean_hsg) if hyg_col else ""
+    )
+    nlcd_clipped["land_use_clean"] = (
+        nlcd_clipped["land_use"].astype(str).str.strip().str.split(".").str[0]
+    )
+
+    ssurgo_grouped = (
+        ssurgo_clipped[["hyg_clean", "geometry"]]
+        .dissolve(by="hyg_clean")
+        .reset_index()
+    )
+    nlcd_grouped = (
+        nlcd_clipped[["land_use_clean", "geometry"]]
+        .dissolve(by="land_use_clean")
+        .reset_index()
+    )
+
+    enforce_cloud_memory_limit(RAM_limit)
+
+    final_intersect = gpd.overlay(
+        ssurgo_grouped, nlcd_grouped, how="intersection"
+    )
+
+    enforce_cloud_memory_limit(RAM_limit)
+
+    if final_intersect.empty:
+        raise ValueError("Spatial intersection yielded empty geometry.")
+
+    final_intersect["grid_code"] = (
+        final_intersect["land_use_clean"] + "_" + final_intersect["hyg_clean"]
+    )
+
+    lookup_df = pd.read_csv(lookup_csv_path)
+    lookup_df.columns = [c.strip().lower() for c in lookup_df.columns]
+
+    lookup_df["grid_code"] = lookup_df["grid_code"].astype(str).str.strip()
+
+    # Parse both CN and C columns
+    lookup_df["cn"] = pd.to_numeric(lookup_df["cn"], errors="coerce")
+    lookup_df["c"] = pd.to_numeric(
+        lookup_df["c"], errors="coerce"
+    )  # Reads column 'C'
+
+    merged = final_intersect.merge(lookup_df, on="grid_code", how="left")
+
+    merged["area_sqm"] = merged.geometry.area
+    total_area = merged["area_sqm"].sum()
+
+    if total_area == 0:
+        raise ValueError("Total area of intersected polygon features is zero.")
+
+    # Calculate Weighted Curve Number (CN)
+    merged["cn"] = merged["cn"].fillna(0)
+    merged["area_x_cn"] = merged["area_sqm"] * merged["cn"]
+    weighted_cn = merged["area_x_cn"].sum() / total_area
+
+    # Calculate Weighted Runoff Coefficient (C)
+    merged["c"] = merged["c"].fillna(0)
+    merged["area_x_c"] = merged["area_sqm"] * merged["c"]
+    weighted_c = merged["area_x_c"].sum() / total_area
+
+    del (
+        ssurgo_clipped,
+        nlcd_clipped,
+        ssurgo_grouped,
+        nlcd_grouped,
+        final_intersect,
+    )
+    gc.collect()
+
+    return weighted_cn, weighted_c, merged
+
+
+
 NLCD_COLOR_MAP = {
     "11": ("#466B9F", "Open Water"),
     "12": ("#D1DEF8", "Perennial Ice/Snow"),
@@ -2012,13 +2116,14 @@ with tab2:
                             f"Lookup table '{active_lookup_path}' not found. Please upload one or ensure it exists in the app root."
                         )
                     else:
-                        weighted_cn, intersected_gdf = calculate_weighted_cn(
+                        weighted_cn,weighted_c, intersected_gdf = calculate_weighted_cn_and_c(
                             st.session_state["cn_aoi_gdf"],
                             st.session_state["cn_nlcd_gdf"],
                             st.session_state["cn_ssurgo_gdf"],
                             active_lookup_path,
                         )
                         st.session_state["final_cn"] = weighted_cn
+                        st.session_state["final_c"] = weighted_c
                         st.session_state["cn_intersected_gdf"] = (
                             intersected_gdf
                         )
@@ -2046,12 +2151,63 @@ with tab2:
 
     if "final_cn" in st.session_state:
         st.markdown("---")
-        col_res1, col_res2 = st.columns([1, 2])
+        intersected_gdf = st.session_state["cn_intersected_gdf"]
+        crs_obj = intersected_gdf.crs
+        
+        # 1. Fallback to EPSG:5070 (Equal Area, Meters) if CRS is missing or Geographic
+        if crs_obj is None or crs_obj.is_geographic:
+            calc_gdf = intersected_gdf.to_crs("EPSG:5070")
+            crs_obj = calc_gdf.crs
+        else:
+            calc_gdf = intersected_gdf
+        
+        # 2. Inspect CRS linear unit name
+        unit_name = ""
+        if crs_obj and crs_obj.axis_info:
+            unit_name = str(crs_obj.axis_info[0].unit_name).lower()
+        
+        raw_area = calc_gdf.geometry.area.sum()
+        
+        # 3. Calculate area based on detected CRS units
+        if "foot" in unit_name or "ft" in unit_name or "feet" in unit_name:
+            total_area_sqft = raw_area
+            total_area_sqmi = total_area_sqft / 27_878_400
+            total_area_sqm = total_area_sqft / 10.7639104167
+            total_area_acres = total_area_sqft / 43_560
+        else:
+            # Standard metric projected CRS (meters)
+            total_area_sqm = raw_area
+            total_area_sqft = total_area_sqm * 10.7639104167
+            total_area_sqmi = total_area_sqft / 27_878_400
+            total_area_acres = total_area_sqft / 43_560
+        
+        # 4. Display Metrics
+        col_res1, col_res2 = st.columns([3, 1])
+        
         with col_res1:
-            st.metric(
-                "Composite Area-Weighted Curve Number (CN)",
-                f"{st.session_state['final_cn']:.2f}",
-            )
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            with m_col1:
+                st.metric(
+                    label="Weighted CN",
+                    value=f"{st.session_state['final_cn']:.2f}",
+                )
+            with m_col2:
+                st.metric(
+                    label="Weighted C",
+                    value=f"{st.session_state['final_c']:.2f}",
+                )
+            with m_col3:
+                st.metric(
+                    label="Total Area (mi²)",
+                    value=f"{total_area_sqmi:.3f}",
+                )
+            with m_col4:
+                st.metric(
+                    label="Total Area (Acres)",
+                    value=f"{total_area_acres:,.0f}",
+                )
+                
+                
         with col_res2:
             if "cn_zip_bytes" in st.session_state:
                 st.download_button(
@@ -2195,12 +2351,13 @@ with tab2:
                     "fillOpacity": 0.7,
                 },
                 tooltip=folium.GeoJsonTooltip(
-                    fields=["grid_code", "cn", "land_use_clean", "hyg_clean"],
+                    fields=["grid_code", "cn", "land_use_clean", "hyg_clean", "c"],
                     aliases=[
                         "Grid Code:",
                         "Curve Number (CN):",
                         "NLCD Code:",
                         "Soil HSG:",
+                        "Runoff Coefficient (C) :",
                     ],
                 ),
             ).add_to(m2)

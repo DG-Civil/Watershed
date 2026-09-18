@@ -1,106 +1,106 @@
-﻿grid_code,cn
-11_A,100
-11_B,100
-11_C,100
-11_D,100
-11_,100
-12_A,100
-12_B,100
-12_C,100
-12_D,100
-12_,100
-21_A,52
-21_B,68
-21_C,78
-21_D,84
-21_,84
-22_A,81
-22_B,88
-22_C,90
-22_D,93
-22_,93
-23_A,84
-23_B,89
-23_C,93
-23_D,94
-23_,94
-24_A,88
-24_B,92
-24_C,93
-24_D,94
-24_,94
-31_A,70
-31_B,81
-31_C,88
-31_D,92
-31_,92
-32_A,70
-32_B,81
-32_C,88
-32_D,92
-32_,92
-41_A,45
-41_B,66
-41_C,77
-41_D,83
-41_,83
-42_A,30
-42_B,55
-42_C,70
-42_D,77
-42_,77
-43_A,36
-43_B,60
-43_C,73
-43_D,79
-43_,79
-51_A,33
-51_B,42
-51_C,55
-51_D,62
-51_,62
-52_A,33
-52_B,42
-52_C,55
-52_D,62
-52_,62
-71_A,47
-71_B,63
-71_C,75
-71_D,85
-71_,85
-72_A,47
-72_B,63
-72_C,75
-72_D,85
-72_,85
-73_A,74
-73_B,74
-73_C,74
-73_D,74
-73_,74
-74_A,79
-74_B,79
-74_C,79
-74_D,79
-74_,79
-81_A,40
-81_B,61
-81_C,73
-81_D,79
-81_,79
-82_A,62
-82_B,74
-82_C,82
-82_D,86
-82_,86
-90_A,86
-90_B,86
-90_C,86
-90_D,86
-90_,86
-95_A,80
-95_B,80
-95_C,80
-95_D,80
-95_,80
+grid_code,CN,C,NLCD_Code,NLCD_Description,Soil_Group,Soil_Description
+11_A,100,1,11,Open Water,A,Sand/High Infiltration
+11_B,100,1,11,Open Water,B,Loam/Moderate Infiltration
+11_C,100,1,11,Open Water,C,Clay Loam/Slow Infiltration
+11_D,100,1,11,Open Water,D,Clay/Heavy Runoff
+11_,100,1,11,Open Water,,
+12_A,98,0.08,12,Perennial Ice/Snow,A,Sand/High Infiltration
+12_B,98,0.12,12,Perennial Ice/Snow,B,Loam/Moderate Infiltration
+12_C,98,0.16,12,Perennial Ice/Snow,C,Clay Loam/Slow Infiltration
+12_D,98,0.22,12,Perennial Ice/Snow,D,Clay/Heavy Runoff
+12_,98,0.22,12,Perennial Ice/Snow,,
+21_A,39,0.1,21,"Developed, Open Space",A,Sand/High Infiltration
+21_B,61,0.15,21,"Developed, Open Space",B,Loam/Moderate Infiltration
+21_C,74,0.2,21,"Developed, Open Space",C,Clay Loam/Slow Infiltration
+21_D,80,0.25,21,"Developed, Open Space",D,Clay/Heavy Runoff
+21_,80,0.25,21,"Developed, Open Space",,
+22_A,57,0.3,22,"Developed, Low Intensity",A,Sand/High Infiltration
+22_B,72,0.35,22,"Developed, Low Intensity",B,Loam/Moderate Infiltration
+22_C,81,0.42,22,"Developed, Low Intensity",C,Clay Loam/Slow Infiltration
+22_D,86,0.5,22,"Developed, Low Intensity",D,Clay/Heavy Runoff
+22_,86,0.5,22,"Developed, Low Intensity",,
+23_A,77,0.5,23,"Developed, Medium Intensity",A,Sand/High Infiltration
+23_B,85,0.58,23,"Developed, Medium Intensity",B,Loam/Moderate Infiltration
+23_C,90,0.65,23,"Developed, Medium Intensity",C,Clay Loam/Slow Infiltration
+23_D,92,0.72,23,"Developed, Medium Intensity",D,Clay/Heavy Runoff
+23_,92,0.72,23,"Developed, Medium Intensity",,
+24_A,89,0.8,24,"Developed, High Intensity",A,Sand/High Infiltration
+24_B,92,0.85,24,"Developed, High Intensity",B,Loam/Moderate Infiltration
+24_C,94,0.9,24,"Developed, High Intensity",C,Clay Loam/Slow Infiltration
+24_D,95,0.95,24,"Developed, High Intensity",D,Clay/Heavy Runoff
+24_,95,0.95,24,"Developed, High Intensity",,
+31_A,77,0.5,31,Barren Land (Rock/Sand/Clay),A,Sand/High Infiltration
+31_B,86,0.55,31,Barren Land (Rock/Sand/Clay),B,Loam/Moderate Infiltration
+31_C,91,0.62,31,Barren Land (Rock/Sand/Clay),C,Clay Loam/Slow Infiltration
+31_D,94,0.7,31,Barren Land (Rock/Sand/Clay),D,Clay/Heavy Runoff
+31_,94,0.7,31,Barren Land (Rock/Sand/Clay),,
+32_A,72,0.4,32,Unconsolidated Shore,A,Sand/High Infiltration
+32_B,82,0.45,32,Unconsolidated Shore,B,Loam/Moderate Infiltration
+32_C,87,0.52,32,Unconsolidated Shore,C,Clay Loam/Slow Infiltration
+32_D,89,0.6,32,Unconsolidated Shore,D,Clay/Heavy Runoff
+32_,89,0.6,32,Unconsolidated Shore,,
+41_A,30,0.08,41,Deciduous Forest,A,Sand/High Infiltration
+41_B,55,0.12,41,Deciduous Forest,B,Loam/Moderate Infiltration
+41_C,70,0.16,41,Deciduous Forest,C,Clay Loam/Slow Infiltration
+41_D,77,0.22,41,Deciduous Forest,D,Clay/Heavy Runoff
+41_,77,0.22,41,Deciduous Forest,,
+42_A,30,0.08,42,Evergreen Forest,A,Sand/High Infiltration
+42_B,55,0.12,42,Evergreen Forest,B,Loam/Moderate Infiltration
+42_C,70,0.16,42,Evergreen Forest,C,Clay Loam/Slow Infiltration
+42_D,77,0.22,42,Evergreen Forest,D,Clay/Heavy Runoff
+42_,77,0.22,42,Evergreen Forest,,
+43_A,30,0.08,43,Mixed Forest,A,Sand/High Infiltration
+43_B,55,0.12,43,Mixed Forest,B,Loam/Moderate Infiltration
+43_C,70,0.16,43,Mixed Forest,C,Clay Loam/Slow Infiltration
+43_D,77,0.22,43,Mixed Forest,D,Clay/Heavy Runoff
+43_,77,0.22,43,Mixed Forest,,
+51_A,35,0.12,51,Dwarf Scrub (Alaska only),A,Sand/High Infiltration
+51_B,56,0.18,51,Dwarf Scrub (Alaska only),B,Loam/Moderate Infiltration
+51_C,70,0.24,51,Dwarf Scrub (Alaska only),C,Clay Loam/Slow Infiltration
+51_D,77,0.3,51,Dwarf Scrub (Alaska only),D,Clay/Heavy Runoff
+51_,77,0.3,51,Dwarf Scrub (Alaska only),,
+52_A,35,0.12,52,Shrub/Scrub,A,Sand/High Infiltration
+52_B,56,0.18,52,Shrub/Scrub,B,Loam/Moderate Infiltration
+52_C,70,0.24,52,Shrub/Scrub,C,Clay Loam/Slow Infiltration
+52_D,77,0.3,52,Shrub/Scrub,D,Clay/Heavy Runoff
+52_,77,0.3,52,Shrub/Scrub,,
+71_A,30,0.15,71,Grassland/Herbaceous,A,Sand/High Infiltration
+71_B,58,0.22,71,Grassland/Herbaceous,B,Loam/Moderate Infiltration
+71_C,71,0.28,71,Grassland/Herbaceous,C,Clay Loam/Slow Infiltration
+71_D,78,0.35,71,Grassland/Herbaceous,D,Clay/Heavy Runoff
+71_,78,0.35,71,Grassland/Herbaceous,,
+72_A,30,0.15,72,Sedge/Herbaceous (Alaska only),A,Sand/High Infiltration
+72_B,58,0.22,72,Sedge/Herbaceous (Alaska only),B,Loam/Moderate Infiltration
+72_C,71,0.28,72,Sedge/Herbaceous (Alaska only),C,Clay Loam/Slow Infiltration
+72_D,78,0.35,72,Sedge/Herbaceous (Alaska only),D,Clay/Heavy Runoff
+72_,78,0.35,72,Sedge/Herbaceous (Alaska only),,
+73_A,30,0.15,73,Lichens (Alaska only),A,Sand/High Infiltration
+73_B,58,0.22,73,Lichens (Alaska only),B,Loam/Moderate Infiltration
+73_C,71,0.28,73,Lichens (Alaska only),C,Clay Loam/Slow Infiltration
+73_D,78,0.35,73,Lichens (Alaska only),D,Clay/Heavy Runoff
+73_,78,0.35,73,Lichens (Alaska only),,
+74_A,30,0.15,74,Moss (Alaska only),A,Sand/High Infiltration
+74_B,58,0.22,74,Moss (Alaska only),B,Loam/Moderate Infiltration
+74_C,71,0.28,74,Moss (Alaska only),C,Clay Loam/Slow Infiltration
+74_D,78,0.35,74,Moss (Alaska only),D,Clay/Heavy Runoff
+74_,78,0.35,74,Moss (Alaska only),,
+81_A,39,0.18,81,Pasture/Hay,A,Sand/High Infiltration
+81_B,61,0.25,81,Pasture/Hay,B,Loam/Moderate Infiltration
+81_C,74,0.32,81,Pasture/Hay,C,Clay Loam/Slow Infiltration
+81_D,80,0.4,81,Pasture/Hay,D,Clay/Heavy Runoff
+81_,80,0.4,81,Pasture/Hay,,
+82_A,67,0.25,82,Cultivated Crops,A,Sand/High Infiltration
+82_B,78,0.35,82,Cultivated Crops,B,Loam/Moderate Infiltration
+82_C,85,0.44,82,Cultivated Crops,C,Clay Loam/Slow Infiltration
+82_D,89,0.52,82,Cultivated Crops,D,Clay/Heavy Runoff
+82_,89,0.52,82,Cultivated Crops,,
+90_A,100,0.05,90,Woody Wetlands,A,Sand/High Infiltration
+90_B,100,0.08,90,Woody Wetlands,B,Loam/Moderate Infiltration
+90_C,100,0.12,90,Woody Wetlands,C,Clay Loam/Slow Infiltration
+90_D,100,0.15,90,Woody Wetlands,D,Clay/Heavy Runoff
+90_,100,0.15,90,Woody Wetlands,,
+95_A,100,0.05,95,Emergent Herbaceous Wetlands,A,Sand/High Infiltration
+95_B,100,0.08,95,Emergent Herbaceous Wetlands,B,Loam/Moderate Infiltration
+95_C,100,0.12,95,Emergent Herbaceous Wetlands,C,Clay Loam/Slow Infiltration
+95_D,100,0.15,95,Emergent Herbaceous Wetlands,D,Clay/Heavy Runoff
+95_,100,0.15,95,Emergent Herbaceous Wetlands,,
