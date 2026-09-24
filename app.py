@@ -1854,7 +1854,7 @@ except Exception as e:
                         type="primary",
                         use_container_width=True,
                     )
-                run_action = False
+                run_delineate = False
 
             
             
