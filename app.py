@@ -2152,9 +2152,19 @@ except Exception as e:
                     wbt.set_verbose_mode(False)
 
                     filled_dem = os.path.join(work_dir, "filled_dem.tif")
-                    wbt.fill_depressions(
-                        dem=merged_dem_path, output=filled_dem, fix_flats=True
+                    # wbt.fill_depressions(
+                    #     dem=merged_dem_path, output=filled_dem, fix_flats=True
+                    # )
+                    
+                    print("Running FillDepressionsWangAndLiu...")
+                    
+                    wbt.fill_depressions_wang_and_liu(
+                        dem=merged_dem_path, 
+                        output=filled_dem, 
+                        fix_flats=True, 
+                        flat_increment=None
                     )
+
 
                     dem_to_use = filled_dem
 
