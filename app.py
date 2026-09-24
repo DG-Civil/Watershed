@@ -3126,95 +3126,95 @@ with tab2:
             total_area_acres = total_area_sqft / 43_560
         
         # 4. Display Metrics
-        col_res1, col_res2 = st.columns([3, 1])
+        # col_res1, col_res2 = st.columns([3, 1])
         
-        with col_res1:
-            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-            with m_col1:
-                st.metric(
-                    label="Weighted CN",
-                    value=f"{st.session_state['final_cn']:.2f}",
-                )
-            with m_col2:
-                st.metric(
-                    label="Weighted C",
-                    value=f"{st.session_state['final_c']:.2f}",
-                )
-            with m_col3:
-                st.metric(
-                    label="Total Area (mi²)",
-                    value=f"{total_area_sqmi:.3f}",
-                )
-            with m_col4:
-                st.metric(
-                    label="Total Area (Acres)",
-                    value=f"{total_area_acres:,.0f}",
-                )
+        # with col_res1:
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with m_col1:
+            st.metric(
+                label="Weighted CN",
+                value=f"{st.session_state['final_cn']:.2f}",
+            )
+        with m_col2:
+            st.metric(
+                label="Weighted C",
+                value=f"{st.session_state['final_c']:.2f}",
+            )
+        with m_col3:
+            st.metric(
+                label="Total Area (mi²)",
+                value=f"{total_area_sqmi:.3f}",
+            )
+        with m_col4:
+            st.metric(
+                label="Total Area (Acres)",
+                value=f"{total_area_acres:,.0f}",
+            )
                 
+        st.divider()
+        #with col_res2:
+        st.subheader("📋 CN Breakdown Table")
+        
+        intersected_gdf = st.session_state["cn_intersected_gdf"]
+        
+        target_crs = intersected_gdf.crs
+        if target_crs is None or target_crs.is_geographic:
+            calc_gdf = intersected_gdf.to_crs("EPSG:5070")
+        else:
+            calc_gdf = intersected_gdf.copy()
 
-        with col_res2:
-            st.subheader("📋 CN Breakdown Table")
-            
-            intersected_gdf = st.session_state["cn_intersected_gdf"]
-            
-            target_crs = intersected_gdf.crs
-            if target_crs is None or target_crs.is_geographic:
-                calc_gdf = intersected_gdf.to_crs("EPSG:5070")
-            else:
-                calc_gdf = intersected_gdf.copy()
+        crs_wkt = calc_gdf.crs.to_wkt().lower()
+        is_feet = "foot" in crs_wkt or "ft" in crs_wkt
+        
+        calc_gdf["area_sqm"] = calc_gdf.geometry.area
+        if is_feet:
+            calc_gdf["area_acres"] = calc_gdf["area_sqm"] / 43560.0
+        else:
+            calc_gdf["area_acres"] = calc_gdf["area_sqm"] / 4046.8564224
 
-            crs_wkt = calc_gdf.crs.to_wkt().lower()
-            is_feet = "foot" in crs_wkt or "ft" in crs_wkt
-            
-            calc_gdf["area_sqm"] = calc_gdf.geometry.area
-            if is_feet:
-                calc_gdf["area_acres"] = calc_gdf["area_sqm"] / 43560.0
-            else:
-                calc_gdf["area_acres"] = calc_gdf["area_sqm"] / 4046.8564224
+        total_acres = calc_gdf["area_acres"].sum()
 
-            total_acres = calc_gdf["area_acres"].sum()
+        
+        
+        summary_df = calc_gdf.copy()
+        summary_df["% Area"] = (summary_df["area_acres"] / total_area_acres * 100).round(2)
+        summary_df["Area (Acres)"] = summary_df["area_acres"].round(2)
+        
+        rename_dict = {
+            "land_use_clean": "Land Use Code",
+            "hyg_clean": "Soil HSG",
+            "cn": "Curve Number (CN)",
+            "c": "Runoff Coeff (C)",
+            "grid_code": "Grid Code"
+            }
+        summary_renamed = summary_df.rename(columns=rename_dict)
+        table_cols = [c for c in ["Land Use Code", "Soil HSG", "Grid Code", "Curve Number (CN)", "Runoff Coeff (C)", "Area (Acres)", "% Area"] if c in summary_renamed.columns]
+        
+        formatted_df = summary_renamed[table_cols]
+        st.dataframe(formatted_df, use_container_width=True)
 
-            
-            
-            summary_df = calc_gdf.copy()
-            summary_df["% Area"] = (summary_df["area_acres"] / total_area_acres * 100).round(2)
-            summary_df["Area (Acres)"] = summary_df["area_acres"].round(2)
-            
-            rename_dict = {
-                "land_use_clean": "Land Use Code",
-                "hyg_clean": "Soil HSG",
-                "cn": "Curve Number (CN)",
-                "c": "Runoff Coeff (C)",
-                "grid_code": "Grid Code"
-                }
-            summary_renamed = summary_df.rename(columns=rename_dict)
-            table_cols = [c for c in ["Land Use Code", "Soil HSG", "Grid Code", "Curve Number (CN)", "Runoff Coeff (C)", "Area (Acres)", "% Area"] if c in summary_renamed.columns]
-            
-            formatted_df = summary_renamed[table_cols]
-            st.dataframe(formatted_df, use_container_width=True)
+        csv_bytes = formatted_df.to_csv(index=False).encode("utf-8")
+        
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.download_button(
+                label="📊 Download CN Breakdown Summary (CSV)",
+                data=csv_bytes,
+                file_name="cn_breakdown_summary.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
-            csv_bytes = formatted_df.to_csv(index=False).encode("utf-8")
-            
-            col_dl1, col_dl2 = st.columns(2)
-            with col_dl1:
+        with col_dl2:
+            if "cn_zip_bytes" in st.session_state:
                 st.download_button(
-                    label="📊 Download CN Breakdown Summary (CSV)",
-                    data=csv_bytes,
-                    file_name="cn_breakdown_summary.csv",
-                    mime="text/csv",
-                    use_container_width=True
+                    label="📦 Download Complete CN GIS Package (Watershed, SSURGO, NLCD & CN Shapefiles)",
+                    data=st.session_state["cn_zip_bytes"],
+                    file_name="cn_hydrology_project_all_shapefiles.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    type="primary",
                 )
-
-            with col_dl2:
-                if "cn_zip_bytes" in st.session_state:
-                    st.download_button(
-                        label="📦 Download Complete CN GIS Package (Watershed, SSURGO, NLCD & CN Shapefiles)",
-                        data=st.session_state["cn_zip_bytes"],
-                        file_name="cn_hydrology_project_all_shapefiles.zip",
-                        mime="application/zip",
-                        use_container_width=True,
-                        type="primary",
-                    )
 
 
                 
