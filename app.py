@@ -5,6 +5,7 @@ import os
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+import json
 
 import branca.colormap as cmp
 import folium
@@ -628,6 +629,18 @@ with tab1:
     st.markdown(
         "[💡 If you want to download DEM over the state of Texas from TxGIO data hub](https://tnris-downloader.streamlit.app/)"
     )
+    
+    st.markdown("### Processing Mode")
+    exec_mode = st.radio(
+        "Select Processing Environment:",
+        [
+            "Cloud-Based (Max 150MB DEM, ~1GB RAM Limit)",
+            "Local Windows Batch (No File Size or RAM Limits)",
+        ],
+        help="Use Local Windows Batch for high-resolution processing on your own machine without installing software.",
+    )
+    st.markdown("---")
+
 
     col_in, col_map = st.columns([1, 2])
 
@@ -912,11 +925,941 @@ with tab1:
                 ]
 
         with col_btn2:
-            run_delineate = st.button(
-                "⛰️ Run WBT Delineation",
-                type="primary",
-                use_container_width=True,
-            )
+            # run_delineate = st.button(
+            #     "⛰️ Run WBT Delineation",
+            #     type="primary",
+            #     use_container_width=True,
+            # )
+            
+            ### start of the import 
+            
+            if exec_mode.startswith("Cloud-Based"):
+                run_delineate = st.button("⛰️ Run WBT Delineation", type="primary", use_container_width=True, disabled=not terrain_files)
+            else:
+                if st.button("📦 Generate Local Batch Toolkit", type="primary", use_container_width=True, disabled=not terrain_files):
+                    config_data = {
+                        "outlet_x": outlet_x, "outlet_y": outlet_y,
+                        "snap_dist": snap_dist, "threshold": threshold,
+                        "stream_option": stream_option,
+                        "target_crs": str(st.session_state.get("target_crs", "EPSG:32614")),
+                    }
+
+                    bat_content = r"""@echo off
+setlocal
+echo ===================================================
+echo     Setting up Portable Python Environment
+echo ===================================================
+set PYTHON_DIR=%~dp0python_env
+set PYTHON_EXE=%PYTHON_DIR%\python.exe
+
+if not exist "%PYTHON_EXE%" (
+    echo Downloading Portable Python Embeddable...
+    powershell -Command "Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.10.11/python-3.10.11-embed-amd64.zip' -OutFile 'python.zip'"
+    if errorlevel 1 goto error
+    
+    echo Extracting Python...
+    powershell -Command "Expand-Archive -Path 'python.zip' -DestinationPath '%PYTHON_DIR%'"
+    if errorlevel 1 goto error
+    del python.zip
+    
+    echo Downloading get-pip.py...
+    powershell -Command "Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile 'get-pip.py'"
+    if errorlevel 1 goto error
+    
+    echo Configuring pip pathways...
+    powershell -Command "(Get-Content '%PYTHON_DIR%\python310._pth') -replace '#import site', 'import site' | Set-Content '%PYTHON_DIR%\python310._pth'"
+    
+    echo Installing pip...
+    "%PYTHON_EXE%" get-pip.py
+    if errorlevel 1 goto error
+    del get-pip.py
+)
+
+echo.
+echo Installing requirements (this may take a minute on the first run)...
+"%PYTHON_EXE%" -m pip install --no-warn-script-location whitebox rasterio geopandas shapely numpy requests pyproj
+if errorlevel 1 goto error
+
+echo.
+echo Executing Local Delineation Script...
+"%PYTHON_EXE%" local_delineate.py
+if errorlevel 1 goto error
+
+rem Verify shapefile was genuinely created
+if not exist "Shapefiles\watershed_boundary.shp" goto error
+
+echo.
+echo ===================================================
+echo     SUCCESS: Watershed shapefiles created successfully!
+echo ===================================================
+pause
+exit /b 0
+
+:error
+echo.
+echo ===================================================
+echo     ERROR: Process failed or shapefiles not found!
+echo ===================================================
+pause
+exit /b 1
+"""
+
+                    py_content = r'''import os, glob, json, sys, zipfile, traceback
+import numpy as np
+import rasterio
+import rasterio.features
+from rasterio.merge import merge
+import geopandas as gpd
+import shapely.geometry as sg
+import requests
+from pyproj import Transformer
+import whitebox
+
+def safe_remove(file_path):
+    """Safely deletes existing files or shapefile sidecars before overwriting."""
+    if not file_path:
+        return
+    base, ext = os.path.splitext(file_path)
+    if ext.lower() == '.shp':
+        extensions = ['.shp', '.shx', '.dbf', '.prj', '.cpg', '.qpj', '.sbx', '.sbn']
+        for e in extensions:
+            p = base + e
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except PermissionError:
+                    print(f"Warning: Could not remove locked file {p}. It may be open in another application.")
+                except Exception:
+                    pass
+    else:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except PermissionError:
+                print(f"Warning: Could not remove locked file {file_path}. It may be open in another application.")
+            except Exception:
+                pass
+
+
+def fetch_texas_streams_rest(target_crs, native_bounds):
+    min_x, min_y, max_x, max_y = native_bounds
+    transformer = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
+    corners = [(min_x, min_y), (min_x, max_y), (max_x, min_y), (max_x, max_y)]
+    lons, lats = zip(*[transformer.transform(x, y) for x, y in corners])
+    xmin, xmax, ymin, ymax = min(lons), max(lons), min(lats), max(lats)
+
+    url = (
+        "https://feature.geographic.texas.gov/arcgis/rest/services/"
+        "Hydrography/Tx_Rivers_Streams_Waterbodies/MapServer/1/query"
+    )
+    params = {
+        "where": "1=1", "geometry": f"{xmin},{ymin},{xmax},{ymax}",
+        "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects", "outFields": "*",
+        "returnGeometry": "true", "f": "geojson", "outSR": "4326",
+    }
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    response = requests.get(url, params=params, headers=headers, timeout=60)
+    response.raise_for_status()
+    geojson_data = response.json()
+
+    if not geojson_data.get("features"): return None
+    gdf = gpd.GeoDataFrame.from_features(geojson_data, crs="EPSG:4326")
+    if gdf.empty: return None
+    return gdf.to_crs(target_crs)
+
+try:
+    def run_local():
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+            
+        os.makedirs('Shapefiles', exist_ok=True)
+        os.makedirs('STREAMS', exist_ok=True)
+        
+        cwd = os.path.abspath('.')
+        def abs_path(p): return os.path.join(cwd, os.path.normpath(p))
+
+        
+        # Read custom resample factor from text file if provided (defaults to 2)
+        resample_factor = 2.0
+        rf_file = abs_path('resample_factor.txt')
+        if os.path.exists(rf_file):
+            try:
+                with open(rf_file, 'r') as rf:
+                    val = float(rf.read().strip())
+                    if val > 0:
+                        resample_factor = val
+                print(f"Loaded custom resample factor: {resample_factor}")
+            except Exception as e:
+                print(f"Could not parse resample_factor.txt ({e}), using default factor 2.0")
+        else:
+            print("resample_factor.txt not found, using default resample factor 2.0")
+            
+            
+        
+        #dem_files = glob.glob('DEM/*.tif') + glob.glob('DEM/*.tiff')
+        
+        # 1. Define generated output names to ignore from previous runs
+        ignored_outputs = {
+            'merged_dem.tif', 'filled_dem.tif', 'resampled_dem.tif', 
+            'burned_dem.tif', 'd8_pointer.tif', 'flow_acc.tif', 
+            'streams_raster.tif', 'watershed_raster.tif'
+        }
+        
+        # 2. Find only raw input DEM tiles
+        all_tifs = glob.glob('DEM/*.tif') + glob.glob('DEM/*.tiff')
+        dem_files = [
+            f for f in all_tifs 
+            if os.path.basename(f).lower() not in ignored_outputs
+        ]
+        
+        if not dem_files:
+            print("ERROR: No .tif files found in the 'DEM' folder.")
+            sys.exit(1)
+
+        print(f"Found {len(dem_files)} DEM files. Processing...")
+        
+        target_dem = 'DEM/merged_dem.tif'
+        if len(dem_files) > 1:
+            safe_remove(target_dem)
+            srcs = [rasterio.open(f) for f in dem_files]
+            mosaic, out_trans = merge(srcs)
+            out_meta = srcs[0].meta.copy()
+            out_meta.update({"height": mosaic.shape[1], "width": mosaic.shape[2], "transform": out_trans})
+            with rasterio.open(target_dem, 'w', **out_meta) as dest:
+                dest.write(mosaic)
+            for s in srcs: s.close()
+        else:
+            target_dem = dem_files[0]
+
+        with rasterio.open(target_dem) as src:
+            res_x, res_y = abs(src.transform[0]), abs(src.transform[4])
+            crs_wkt = src.crs.to_wkt().lower() if src.crs else ""
+            is_feet = "foot" in crs_wkt or "ft" in crs_wkt
+            is_deg = src.crs.is_geographic if src.crs else False
+            native_bounds = src.bounds
+
+        wbt = whitebox.WhiteboxTools()
+        wbt.set_verbose_mode(True)
+        
+       
+        wbt.set_working_dir(cwd)
+
+        print("Filling DEM Depressions...")
+        
+        target_dem = abs_path(target_dem)
+        filled_dem = abs_path('DEM/filled_dem.tif')
+        
+        # 1. Check if the file size is greater than 3 GB (3 * 1024 * 1024 * 1024 bytes)
+        file_size_bytes = os.path.getsize(target_dem)
+        three_gb = 3 * 1024 * 1024 * 1024
+        
+        from rasterio.enums import Resampling
+        import gc
+
+        if file_size_bytes > three_gb:
+            print(f"DEM size ({file_size_bytes / (1024**3):.2f} GB) exceeds 3 GB limit. Resampling with Rasterio...")
+            
+            resampled_dem = abs_path('DEM/resampled_dem.tif')
+            safe_remove(resampled_dem)
+            
+            with rasterio.open(target_dem) as src:
+                current_res_x = abs(src.transform[0])
+                current_res_y = abs(src.transform[4])
+                new_res_x = current_res_x * resample_factor
+                
+                print(f"Changing pixel size from {current_res_x:.2f} to {new_res_x:.2f} (factor = {resample_factor})")
+                
+                # Calculate output pixel dimensions (reduced 36x for factor 6.0)
+                new_height = int(round(src.height / resample_factor))
+                new_width = int(round(src.width / resample_factor))
+                
+                # Recalculate affine transform
+                new_transform = src.transform * src.transform.scale(
+                    (src.width / new_width),
+                    (src.height / new_height)
+                )
+                
+                out_meta = src.meta.copy()
+                out_meta.update({
+                    "driver": "GTiff",
+                    "height": new_height,
+                    "width": new_width,
+                    "transform": new_transform,
+                    "tiled": True,
+                    "blockxsize": 512,
+                    "blockysize": 512,
+                    "compress": "lzw"
+                })
+                
+                # Decimated Read: Rasterio downsamples on-the-fly while reading from disk.
+                # RAM allocation is limited ONLY to the output array size (~110 MB).
+                data = src.read(
+                    out_shape=(src.count, new_height, new_width),
+                    resampling=Resampling.bilinear
+                )
+                
+                with rasterio.open(resampled_dem, 'w', **out_meta) as dest:
+                    dest.write(data)
+                    
+                del data
+                gc.collect()
+                
+            # Point subsequent WhiteboxTools steps to the light, downsampled DEM
+            target_dem = resampled_dem
+        
+        # if file_size_bytes > three_gb:
+        #     print(f"DEM size ({file_size_bytes / (1024**3):.2f} GB) exceeds 3 GB limit. Resampling...")
+            
+        #     # 2. Open the DEM to find its current pixel size
+        #     with rasterio.open(target_dem) as src:
+        #         current_res_x = abs(src.transform[0])  # Pixel width
+        #         current_res_y = abs(src.transform[4])  # Pixel height
+            
+        #     # 3. Double the resolution size
+        #     new_res_x = current_res_x * resample_factor
+            
+        #     # 4. Create a temporary path for the downsampled DEM
+        #     resampled_dem = abs_path('DEM/resampled_dem.tif')
+        #     safe_remove(resampled_dem)
+            
+        #     print(f"Changing pixel size from {current_res_x:.2f} to {new_res_x:.2f} (factor = {resample_factor})")
+            
+        #     # Run WhiteboxTools resample
+        #     wbt.resample(
+        #         inputs=target_dem,
+        #         output=resampled_dem,
+        #         cell_size=new_res_x,
+        #         method="bilinear"  # Best method for continuous elevation data
+        #     )
+            
+        #     # Point the filling tool to the new, lighter DEM
+        #     target_dem = resampled_dem
+        
+        # 5. Run the depression filling tool
+        # print("Filling DEM Depressions...")
+        # safe_remove(filled_dem)
+        # wbt.fill_depressions(dem=target_dem, output=filled_dem, fix_flats=True,flat_increment=None)
+        
+        print("Running FillDepressionsWangAndLiu...")
+        safe_remove(filled_dem)
+        wbt.fill_depressions_wang_and_liu(
+            dem=target_dem, 
+            output=filled_dem, 
+            fix_flats=True, 
+            flat_increment=None
+        )
+        
+        # Optional: Clean up the temporary resampled file if it was created
+        if 'resampled_dem' in locals() and os.path.exists(resampled_dem):
+            safe_remove(resampled_dem)
+        
+        
+
+        dem_to_use = filled_dem
+
+        stream_option = config.get('stream_option', 'None')
+        burn_streams_path = None
+        
+        if stream_option == "Upload Stream Shapefile (ZIP)":
+            streams_zip_path = abs_path('STREAMS/streams.zip')
+            if os.path.exists(streams_zip_path):
+                print("Extracting uploaded streams...")
+                with zipfile.ZipFile(streams_zip_path, 'r') as zf:
+                    zf.extractall(abs_path('STREAMS/extracted'))
+                shp_files = glob.glob(abs_path('STREAMS/extracted/**/*.shp'), recursive=True)
+                if shp_files:
+                    burn_streams_path = shp_files[0]
+                    burn_gdf = gpd.read_file(burn_streams_path)
+                    if burn_gdf.crs != config['target_crs']:
+                        burn_gdf = burn_gdf.to_crs(config['target_crs'])
+                        burn_streams_path = abs_path('STREAMS/reproj_streams.shp')
+                        safe_remove(burn_streams_path)
+                        burn_gdf.to_file(burn_streams_path)
+
+        elif stream_option == "Use Texas Gov Dataset (ArcGIS REST)":
+            print("Querying Texas Hydrography ArcGIS REST Service...")
+            tx_gdf = fetch_texas_streams_rest(config['target_crs'], native_bounds)
+            if tx_gdf is not None and not tx_gdf.empty:
+                burn_streams_path = abs_path('STREAMS/tx_rest_streams.shp')
+                safe_remove(burn_streams_path)
+                tx_gdf.to_file(burn_streams_path)
+                print("SUCCESS: Downloaded Texas streams to STREAMS folder.")
+
+        if burn_streams_path and os.path.exists(burn_streams_path):
+            print("Burning streams into DEM...")
+            burned_dem = abs_path('DEM/burned_dem.tif')
+            safe_remove(burned_dem)
+            wbt.fill_burn(dem=filled_dem, streams=burn_streams_path, output=burned_dem)
+            if os.path.exists(burned_dem):
+                dem_to_use = burned_dem
+
+        print("Calculating Flow Direction and Accumulation...")
+        d8_pointer = abs_path('DEM/d8_pointer.tif')
+        flow_acc = abs_path('DEM/flow_acc.tif')
+        safe_remove(d8_pointer)
+        safe_remove(flow_acc)
+        wbt.d8_pointer(dem=dem_to_use, output=d8_pointer)
+        wbt.d8_flow_accumulation(i=dem_to_use, output=flow_acc)
+
+        print("Extracting Streams...")
+        streams_raster = abs_path('DEM/streams_raster.tif')
+        streams_vector = abs_path('Shapefiles/streams_network.shp')
+        safe_remove(streams_raster)
+        safe_remove(streams_vector)
+        wbt.extract_streams(flow_accum=flow_acc, output=streams_raster, threshold=config['threshold'])
+        wbt.raster_streams_to_vector(streams=streams_raster, d8_pntr=d8_pointer, output=streams_vector)
+        
+        # Explicitly assign target CRS to stream network so it includes a valid .prj file
+        if os.path.exists(streams_vector):
+            gdf_st = gpd.read_file(streams_vector)
+            gdf_st = gdf_st.set_crs(config['target_crs'], allow_override=True)
+            safe_remove(streams_vector)
+            gdf_st.to_file(streams_vector)
+        
+    
+
+        x_coord, y_coord = config['outlet_x'], config['outlet_y']
+        print(f"Snapping Pour Point near ({x_coord}, {y_coord})...")
+        pour_pts_shp = abs_path('DEM/pour_point.shp')
+        safe_remove(pour_pts_shp)
+        gpd.GeoDataFrame(geometry=[sg.Point(x_coord, y_coord)], crs=config['target_crs']).to_file(pour_pts_shp)
+
+        snapped_pour_pts = abs_path('Shapefiles/snapped_pour_points.shp')
+        safe_remove(snapped_pour_pts)
+        effective_snap = float(config['snap_dist'])
+        if is_deg:
+            effective_snap = effective_snap / (364173.0 if is_feet else 111000.0)
+            
+        wbt.snap_pour_points(pour_pts=pour_pts_shp, flow_accum=flow_acc, output=snapped_pour_pts, snap_dist=effective_snap)
+
+        if not os.path.exists(snapped_pour_pts):
+            print(f"\nERROR: WhiteboxTools failed to snap the pour point. Ensure coordinates ({x_coord}, {y_coord}) are inside the DEM.")
+            sys.exit(1)
+
+        print("Delineating Catchment...")
+        watershed_raster = abs_path('DEM/watershed_raster.tif')
+        safe_remove(watershed_raster)
+        wbt.watershed(d8_pntr=d8_pointer, pour_pts=snapped_pour_pts, output=watershed_raster)
+
+        if not os.path.exists(watershed_raster):
+            print("\nERROR: WhiteboxTools failed to create the watershed raster.")
+            sys.exit(1)
+
+        print("Exporting Watershed Boundary Shapefile...")
+        with rasterio.open(watershed_raster) as src_ws:
+            ws_data = src_ws.read(1)
+            ws_mask = ws_data > 0
+            shapes = rasterio.features.shapes(ws_data, mask=ws_mask, transform=src_ws.transform)
+            ws_geoms = [sg.shape(s) for s, v in shapes if v > 0]
+            
+        if not ws_geoms:
+            print("ERROR: Empty watershed resulting from delineation. Adjust threshold or outlet coordinates.")
+            sys.exit(1)
+
+        
+        ws_gdf = gpd.GeoDataFrame(geometry=ws_geoms, crs=config['target_crs'])
+        ws_path = abs_path('Shapefiles/watershed_boundary.shp')
+        safe_remove(ws_path)
+        ws_gdf.to_file(ws_path)
+        
+        if os.path.exists(streams_vector):
+            raw_st = gpd.read_file(streams_vector).set_crs(config['target_crs'], allow_override=True)
+            clipped_st = gpd.clip(raw_st, ws_gdf)
+            clipped_st = clipped_st[clipped_st.geometry.type.isin(["LineString", "MultiLineString"])]
+            if not clipped_st.empty:
+                clip_path = abs_path('Shapefiles/streams_clipped.shp')
+                safe_remove(clip_path)
+                clipped_st.to_file(clip_path)
+
+        print("Calculating Longest Flow Path...")
+        flowpath_shp = abs_path('Shapefiles/longest_flowpath.shp')
+        safe_remove(flowpath_shp)
+        wbt.longest_flowpath(dem=dem_to_use, basins=watershed_raster, output=flowpath_shp)
+        
+        # Explicitly assign target CRS to longest flow path so it includes a valid .prj file
+        if os.path.exists(flowpath_shp):
+            gdf_fp = gpd.read_file(flowpath_shp)
+            gdf_fp = gdf_fp.set_crs(config['target_crs'], allow_override=True)
+            safe_remove(flowpath_shp)
+            gdf_fp.to_file(flowpath_shp)
+            
+        
+        print("\n" + "="*55)
+        print("            HYDROLOGIC CHARACTERISTICS SUMMARY")
+        print("="*55)
+        
+        try:
+            # 1. Ensure watershed GeoDataFrame has the target CRS set
+            if ws_gdf.crs is None:
+                ws_gdf = ws_gdf.set_crs(config['target_crs'])
+            
+            # Safely reproject watershed to a metric CRS (UTM) for accurate area calculation
+            if ws_gdf.crs.is_geographic:
+                ws_metric = ws_gdf.to_crs(ws_gdf.estimate_utm_crs())
+            else:
+                # If already projected (e.g. State Plane feet), route through WGS84 to estimate metric UTM
+                ws_metric = ws_gdf.to_crs("EPSG:4326").to_crs(ws_gdf.to_crs("EPSG:4326").estimate_utm_crs())
+                
+            area_sqm = ws_metric.geometry.area.sum()
+            area_mi2 = area_sqm * 3.86102e-7
+            area_acres = area_sqm * 0.000247105
+            
+            print(f"Drainage Area:       {area_mi2:.4f} mi²")
+            print(f"                     {area_acres:.2f} acres")
+            
+            # 2. Handle Longest Flow Path shapefile (assigning missing CRS from config)
+            if os.path.exists(flowpath_shp):
+                lfp_gdf = gpd.read_file(flowpath_shp)
+                if lfp_gdf.crs is None:
+                    lfp_gdf = lfp_gdf.set_crs(config['target_crs'])
+                
+                if lfp_gdf.crs.is_geographic:
+                    lfp_metric = lfp_gdf.to_crs(lfp_gdf.estimate_utm_crs())
+                else:
+                    lfp_metric = lfp_gdf.to_crs("EPSG:4326").to_crs(lfp_gdf.to_crs("EPSG:4326").estimate_utm_crs())
+                    
+                len_m = lfp_metric.geometry.length.sum()
+                len_mi = len_m * 0.000621371
+                len_yd = len_m * 1.09361
+                
+                print(f"Longest Flow Path:   {len_mi:.4f} miles")
+                print(f"                     {len_yd:.2f} yards")
+            else:
+                print("Longest Flow Path:   Not generated.")
+                
+        except Exception as e:
+            print(f"Could not compute hydrologic characteristics: {e}")
+            
+        
+        print("="*55 + "\n")
+        
+        print("\n===================================================")
+        print("     SUCCESS: GIS Files generated in 'Shapefiles' folder.")
+        print("===================================================\n")
+
+    if __name__ == '__main__':
+        run_local()
+
+except Exception as e:
+    print(f"\nCRITICAL ERROR: {str(e)}")
+    traceback.print_exc()
+    sys.exit(1)
+'''
+
+                    cn_bat_content = r"""@echo off
+setlocal
+echo ===================================================
+echo     Setting up Portable Python Environment for CN
+echo ===================================================
+set PYTHON_DIR=%~dp0python_env
+set PYTHON_EXE=%PYTHON_DIR%\python.exe
+
+if not exist "%PYTHON_EXE%" (
+    echo Downloading Portable Python Embeddable...
+    powershell -Command "Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.10.11/python-3.10.11-embed-amd64.zip' -OutFile 'python.zip'"
+    if errorlevel 1 goto error
+    
+    echo Extracting Python...
+    powershell -Command "Expand-Archive -Path 'python.zip' -DestinationPath '%PYTHON_DIR%'"
+    if errorlevel 1 goto error
+    del python.zip
+    
+    echo Downloading get-pip.py...
+    powershell -Command "Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile 'get-pip.py'"
+    if errorlevel 1 goto error
+    
+    echo Configuring pip pathways...
+    powershell -Command "(Get-Content '%PYTHON_DIR%\python310._pth') -replace '#import site', 'import site' | Set-Content '%PYTHON_DIR%\python310._pth'"
+    
+    echo Installing pip...
+    "%PYTHON_EXE%" get-pip.py
+    if errorlevel 1 goto error
+    del get-pip.py
+)
+
+echo.
+echo Installing requirements (this may take a minute on first run)...
+"%PYTHON_EXE%" -m pip install --no-warn-script-location rasterio geopandas shapely numpy requests pyproj pandas
+if errorlevel 1 goto error
+
+echo.
+echo Executing Local Curve Number Script...
+"%PYTHON_EXE%" local_cn.py
+if errorlevel 1 goto error
+
+rem Verify shapefile was genuinely created
+if not exist "Shapefiles\curve_number_polygons.shp" goto error
+
+echo.
+echo ===================================================
+echo     SUCCESS: Curve Number shapefiles created!
+echo ===================================================
+pause
+exit /b 0
+
+:error
+echo.
+echo ===================================================
+echo     ERROR: Process failed or shapefiles not found!
+echo ===================================================
+pause
+exit /b 1
+"""
+
+                    cn_py_content = r'''import os, sys, json, tempfile, traceback, requests, io
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import shapely.geometry as sg
+import shapely.ops
+import rasterio
+import rasterio.features
+from rasterio.windows import Window
+
+def safe_remove(file_path):
+    """Safely deletes existing files or shapefile sidecars before overwriting."""
+    if not file_path:
+        return
+    base, ext = os.path.splitext(file_path)
+    if ext.lower() == '.shp':
+        extensions = ['.shp', '.shx', '.dbf', '.prj', '.cpg', '.qpj', '.sbx', '.sbn']
+        for e in extensions:
+            p = base + e
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except PermissionError:
+                    print(f"Warning: Could not remove locked file {p}. It may be open in another application.")
+                except Exception:
+                    pass
+    else:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except PermissionError:
+                print(f"Warning: Could not remove locked file {file_path}. It may be open in another application.")
+            except Exception:
+                pass
+
+
+def extract_local_nlcd_windowed(src, aoi_proj):
+    xmin, ymin, xmax, ymax = aoi_proj.total_bounds
+    win = src.window(xmin, ymin, xmax, ymax)
+    full_canvas = Window(0, 0, src.width, src.height)
+    win = win.intersection(full_canvas)
+
+    win_trans = src.window_transform(win)
+    data = src.read(1, window=win)
+    height, width = data.shape
+
+    if height == 0 or width == 0:
+        raise ValueError("AOI extent has zero area overlap with the raster canvas.")
+
+    geoms = [g for g in aoi_proj.geometry if g is not None and not g.is_empty]
+    inside_mask = rasterio.features.geometry_mask(geoms, out_shape=(height, width), transform=win_trans, invert=True, all_touched=True)
+
+    valid_mask = inside_mask & (data > 0) & (data < 255)
+    if not np.any(valid_mask):
+        raise ValueError("No valid NLCD land cover pixels found within watershed boundary.")
+
+    results = (
+        {"properties": {"land_use": str(int(val))}, "geometry": geom}
+        for geom, val in rasterio.features.shapes(data, mask=valid_mask, transform=win_trans)
+    )
+
+    nlcd_gdf = gpd.GeoDataFrame.from_features(list(results), crs=src.crs)
+    nlcd_gdf = nlcd_gdf.dissolve(by="land_use").reset_index()
+    return nlcd_gdf
+
+
+def fetch_nlcd_dataset(aoi_gdf):
+    aoi_5070 = aoi_gdf.to_crs("EPSG:5070")
+    bounds = aoi_5070.total_bounds
+
+    xmin, ymin = bounds[0] - 30, bounds[1] - 30
+    xmax, ymax = bounds[2] + 30, bounds[3] + 30
+
+    width = int((xmax - xmin) / 30)
+    height = int((ymax - ymin) / 30)
+    bbox_str = f"{xmin},{ymin},{xmax},{ymax}"
+
+    wcs_url = (
+        "https://www.mrlc.gov/geoserver/ows?version=1.1.0&SERVICE=WCS&VERSION=1.0.0&"
+        "request=GetCoverage&format=GeoTIFF&coverage=mrlc_download:NLCD_2021_Land_Cover_L48&"
+        f"crs=EPSG:5070&width={width}&height={height}&bbox={bbox_str}"
+    )
+
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".tif")
+    os.close(temp_fd)
+
+    try:
+        response = requests.get(wcs_url, stream=True, timeout=120)
+        response.raise_for_status()
+
+        with open(temp_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        with rasterio.open(temp_path) as src:
+            nlcd_gdf = extract_local_nlcd_windowed(src, aoi_5070)
+            return nlcd_gdf
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def download_ssurgo_extended(aoi_gdf):
+    aoi_4326 = aoi_gdf.to_crs("EPSG:4326")
+    bounds = aoi_4326.total_bounds
+    bbox_str = f"{bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}"
+
+    wfs_url = "https://sdmdataaccess.sc.egov.usda.gov/Spatial/SDMWGS84GEOGRAPHIC.wfs".strip()
+    params = {
+        "SERVICE": "WFS", "VERSION": "1.1.0", "REQUEST": "GetFeature",
+        "TYPENAME": "mapunitpolyextended", "SRSNAME": "EPSG:4326", "BBOX": bbox_str,
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    response = requests.get(wfs_url, params=params, headers=headers, timeout=60)
+    response.raise_for_status()
+
+    gml_bytes = io.BytesIO(response.content)
+    ssurgo_gdf = gpd.read_file(gml_bytes)
+
+    if ssurgo_gdf.empty:
+        return ssurgo_gdf
+
+    ssurgo_gdf.geometry = ssurgo_gdf.geometry.map(lambda geom: (shapely.ops.transform(lambda x, y: (y, x), geom) if geom else None))
+    ssurgo_gdf.set_crs("EPSG:4326", inplace=True)
+    return ssurgo_gdf
+
+
+def clean_hsg(val):
+    if pd.isna(val) or val is None: return ""
+    val_str = str(val).strip().upper()
+    if val_str in ["NONE", "NULL", "NAN", "", "0"]: return ""
+    if "/" in val_str:
+        parts = [p.strip() for p in val_str.split("/") if p.strip()]
+        return parts[-1] if parts else ""
+    return val_str
+
+
+def calculate_weighted_cn_and_c(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv_path):
+    target_crs = aoi_gdf.crs if (aoi_gdf.crs and aoi_gdf.crs.is_projected) else "EPSG:5070"
+    aoi_proj = aoi_gdf.to_crs(target_crs)
+    nlcd_proj = nlcd_gdf.to_crs(target_crs)
+    ssurgo_proj = ssurgo_gdf.to_crs(target_crs)
+
+    ssurgo_clipped = gpd.clip(ssurgo_proj, aoi_proj)
+    nlcd_clipped = gpd.clip(nlcd_proj, aoi_proj)
+
+    if ssurgo_clipped.empty or nlcd_clipped.empty:
+        raise ValueError("SSURGO or NLCD dataset returned empty geometry when clipped.")
+
+    hyg_col = next((c for c in ssurgo_clipped.columns if c.lower() in ["hydgrpdcd", "hydgrp", "hyg"]), None)
+    ssurgo_clipped["hyg_clean"] = ssurgo_clipped[hyg_col].apply(clean_hsg) if hyg_col else ""
+    nlcd_clipped["land_use_clean"] = nlcd_clipped["land_use"].astype(str).str.strip().str.split(".").str[0]
+
+    ssurgo_grouped = ssurgo_clipped[["hyg_clean", "geometry"]].dissolve(by="hyg_clean").reset_index()
+    nlcd_grouped = nlcd_clipped[["land_use_clean", "geometry"]].dissolve(by="land_use_clean").reset_index()
+
+    final_intersect = gpd.overlay(ssurgo_grouped, nlcd_grouped, how="intersection")
+
+    if final_intersect.empty:
+        raise ValueError("Spatial intersection yielded empty geometry.")
+
+    final_intersect["grid_code"] = final_intersect["land_use_clean"] + "_" + final_intersect["hyg_clean"]
+    lookup_df = pd.read_csv(lookup_csv_path)
+    lookup_df.columns = [c.strip().lower() for c in lookup_df.columns]
+    lookup_df["grid_code"] = lookup_df["grid_code"].astype(str).str.strip()
+    lookup_df["cn"] = pd.to_numeric(lookup_df["cn"], errors="coerce")
+    lookup_df["c"] = pd.to_numeric(lookup_df["c"], errors="coerce")
+
+    merged = final_intersect.merge(lookup_df, on="grid_code", how="left")
+    merged["area_sqm"] = merged.geometry.area
+    total_area = merged["area_sqm"].sum()
+
+    if total_area == 0:
+        raise ValueError("Total area of intersected polygon features is zero.")
+
+    merged["cn"] = merged["cn"].fillna(0)
+    merged["area_x_cn"] = merged["area_sqm"] * merged["cn"]
+    weighted_cn = merged["area_x_cn"].sum() / total_area
+
+    merged["c"] = merged["c"].fillna(0)
+    merged["area_x_c"] = merged["area_sqm"] * merged["c"]
+    weighted_c = merged["area_x_c"].sum() / total_area
+
+    return weighted_cn, weighted_c, merged
+
+
+try:
+    def run_local_cn():
+        cwd = os.path.abspath('.')
+        def abs_path(p): return os.path.join(cwd, os.path.normpath(p))
+
+        ws_shp = abs_path("Shapefiles/watershed_boundary.shp")
+        if not os.path.exists(ws_shp):
+            print("\nERROR: Watershed boundary shapefile not found at 'Shapefiles/watershed_boundary.shp'.")
+            print("Please run 'execute.bat' first to delineate the watershed boundary.")
+            sys.exit(1)
+
+        print(f"Loading watershed boundary from '{ws_shp}'...")
+        aoi_gdf = gpd.read_file(ws_shp)
+
+        print("\n1/3 Downloading 2021 NLCD Land Cover Dataset (MRLC WCS)...")
+        nlcd_gdf = fetch_nlcd_dataset(aoi_gdf)
+        nlcd_out = abs_path("Shapefiles/nlcd_landuse.shp")
+        safe_remove(nlcd_out)
+        nlcd_gdf.to_file(nlcd_out)
+        print(f"      Saved NLCD layer to '{nlcd_out}'")
+
+        print("\n2/3 Downloading SSURGO Soil Dataset (USDA WFS)...")
+        ssurgo_gdf = download_ssurgo_extended(aoi_gdf)
+        if ssurgo_gdf.empty:
+            print("ERROR: SSURGO returned no soil polygon data for this watershed boundary.")
+            sys.exit(1)
+
+        ssurgo_out = abs_path("Shapefiles/ssurgo_soils.shp")
+        safe_remove(ssurgo_out)
+        ssurgo_gdf.to_file(ssurgo_out)
+        print(f"      Saved SSURGO layer to '{ssurgo_out}'")
+
+        print("\n3/3 Calculating Curve Number and Runoff Coefficient...")
+        lookup_csv = abs_path("NLCD_SHG_CN_lookup.csv")
+        if not os.path.exists(lookup_csv):
+            print(f"ERROR: Lookup table '{lookup_csv}' not found. Ensure NLCD_SHG_CN_lookup.csv exists in the root folder.")
+            sys.exit(1)
+
+        weighted_cn, weighted_c, merged_gdf = calculate_weighted_cn_and_c(aoi_gdf, nlcd_gdf, ssurgo_gdf, lookup_csv)
+        cn_out = abs_path("Shapefiles/curve_number_polygons.shp")
+        safe_remove(cn_out)
+        merged_gdf.to_file(cn_out)
+        print(f"      Saved CN Polygons layer to '{cn_out}'")
+
+        target_crs = merged_gdf.crs
+        if target_crs is None or target_crs.is_geographic:
+            calc_gdf = merged_gdf.to_crs("EPSG:5070")
+        else:
+            calc_gdf = merged_gdf.copy()
+
+        crs_wkt = calc_gdf.crs.to_wkt().lower()
+        is_feet = "foot" in crs_wkt or "ft" in crs_wkt
+
+        calc_gdf["area_sqm"] = calc_gdf.geometry.area
+        if is_feet:
+            calc_gdf["area_acres"] = calc_gdf["area_sqm"] / 43560.0
+        else:
+            calc_gdf["area_acres"] = calc_gdf["area_sqm"] / 4046.8564224
+
+        total_acres = calc_gdf["area_acres"].sum()
+        total_sqmi = total_acres / 640.0
+
+        print("\n" + "="*65)
+        print("        CURVE NUMBER & RUNOFF COEFFICIENT SUMMARY")
+        print("="*65)
+        print(f"Composite Curve Number (CN): {weighted_cn:.2f}")
+        print(f"Composite Runoff Coeff. (C): {weighted_c:.2f}")
+        print(f"Total Watershed Area:        {total_acres:.2f} acres ({total_sqmi:.4f} mi²)")
+        print("="*65)
+        print("\nDETAILED BREAKDOWN BY LAND USE & SOIL GROUP:")
+        print("-" * 65)
+
+        calc_gdf["% Area"] = (calc_gdf["area_acres"] / total_acres * 100).round(2)
+        calc_gdf["Area (Acres)"] = calc_gdf["area_acres"].round(2)
+
+        rename_dict = {
+            "land_use_clean": "NLCD",
+            "hyg_clean": "HSG",
+            "grid_code": "GridCode",
+            "cn": "CN",
+            "c": "C",
+        }
+        disp_df = calc_gdf.rename(columns=rename_dict)
+        cols = [c for c in ["NLCD", "HSG", "GridCode", "CN", "C", "Area (Acres)", "% Area"] if c in disp_df.columns]
+        print(disp_df[cols].to_string(index=False))
+        print("="*65 + "\n")
+
+    if __name__ == '__main__':
+        run_local_cn()
+
+except Exception as e:
+    print(f"\nCRITICAL ERROR: {str(e)}")
+    traceback.print_exc()
+    sys.exit(1)
+'''
+
+
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+                        zipf.writestr("DEM/", "")
+                        zipf.writestr("Shapefiles/", "")
+                        zipf.writestr("STREAMS/", "")
+                        zipf.writestr("Step_1_Watershed_Delineate.bat", bat_content)
+                        zipf.writestr("local_delineate.py", py_content)
+                        zipf.writestr("Step_2_CN_&_C_calc.bat", cn_bat_content)
+                        zipf.writestr("local_cn.py", cn_py_content)
+                        zipf.writestr("config.json", json.dumps(config_data, indent=4))
+                        zipf.writestr("resample_factor.txt", "2")
+
+                        if "lookup_upload_file" in st.session_state and st.session_state.lookup_upload_file is not None:
+                            lookup_upload = st.session_state.lookup_upload_file
+                            zipf.writestr("NLCD_SHG_CN_lookup.csv", lookup_upload.getvalue())
+                        elif os.path.exists("NLCD_SHG_CN_lookup.csv"):
+                            with open("NLCD_SHG_CN_lookup.csv", "rb") as f_lk:
+                                zipf.writestr("NLCD_SHG_CN_lookup.csv", f_lk.read())
+                        else:
+                            default_csv = (
+                                "grid_code,cn,c\n"
+                                "11_A,0,0.00\n11_B,0,0.00\n11_C,0,0.00\n11_D,0,0.00\n"
+                                "21_A,39,0.15\n21_B,61,0.20\n21_C,74,0.25\n21_D,80,0.30\n"
+                                "22_A,54,0.22\n22_B,70,0.28\n22_C,80,0.35\n22_D,85,0.40\n"
+                                "23_A,77,0.45\n23_B,85,0.55\n23_C,90,0.65\n23_D,92,0.75\n"
+                                "24_A,89,0.70\n24_B,92,0.80\n24_C,94,0.85\n24_D,95,0.90\n"
+                                "31_A,77,0.30\n31_B,86,0.40\n31_C,91,0.50\n31_D,94,0.60\n"
+                                "41_A,36,0.10\n41_B,60,0.15\n41_C,73,0.20\n41_D,79,0.25\n"
+                                "42_A,30,0.10\n42_B,55,0.15\n42_C,70,0.20\n42_D,77,0.25\n"
+                                "43_A,43,0.12\n43_B,65,0.18\n43_C,76,0.22\n43_D,82,0.28\n"
+                                "52_A,35,0.12\n52_B,56,0.18\n52_C,70,0.22\n52_D,77,0.28\n"
+                                "71_A,39,0.15\n71_B,61,0.22\n71_C,74,0.28\n71_D,80,0.35\n"
+                                "81_A,39,0.15\n81_B,61,0.22\n81_C,74,0.28\n81_D,80,0.35\n"
+                                "82_A,67,0.25\n82_B,78,0.32\n82_C,85,0.40\n82_D,89,0.48\n"
+                                "90_A,30,0.05\n90_B,55,0.10\n90_C,70,0.15\n90_D,77,0.20\n"
+                                "95_A,30,0.05\n95_B,55,0.10\n95_C,70,0.15\n95_D,77,0.20\n"
+                            )
+                            zipf.writestr("NLCD_SHG_CN_lookup.csv", default_csv)
+
+
+                        for dem_item in st.session_state.get("dem_files_data", []):
+                            if dem_item["is_xml"]:
+                                with tempfile.TemporaryDirectory() as temp_xml_dir:
+                                    xml_buf = io.BytesIO(dem_item["bytes"])
+                                    temp_tif = os.path.join(temp_xml_dir, "converted_xml.tif")
+                                    parse_landxml_to_geotiff(xml_buf, temp_tif)
+                                    with open(temp_tif, "rb") as f:
+                                        zipf.writestr(f"DEM/{dem_item['name'].replace('.xml', '.tif')}", f.read())
+                            else:
+                                zipf.writestr(f"DEM/{dem_item['name']}", dem_item["bytes"])
+
+                        if stream_burn_file is not None:
+                            zipf.writestr("STREAMS/streams.zip", stream_burn_file.getvalue())
+
+                    st.download_button(
+                        label="⬇️ Download Complete Local Toolkit (.zip)",
+                        data=zip_buffer.getvalue(),
+                        file_name="Local_Delineation_Kit.zip",
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                run_action = False
+
+            
+            
+            
+            ### end of the imports
 
         if "watershed_results" in st.session_state:
             st.markdown("---")
@@ -2018,9 +2961,10 @@ with tab2:
     with lookup_col1:
         lookup_upload = st.file_uploader(
             "Upload Custom NLCD-HSG CN Lookup Table (.csv)",
-            type=["csv"],
+            type=["csv"],  key="lookup_upload_file",
             help="Optional. If not uploaded, the default root folder table will be used.",
         )
+        
 
     with lookup_col2:
         default_lookup_path = "NLCD_SHG_CN_lookup.csv"
@@ -2207,17 +3151,63 @@ with tab2:
                     value=f"{total_area_acres:,.0f}",
                 )
                 
-                
+
         with col_res2:
-            if "cn_zip_bytes" in st.session_state:
+            st.subheader("📋 CN Breakdown Table")
+            
+            summary_df = calc_gdf.copy()
+            summary_df["% Area"] = (summary_df["area_acres"] / total_area_acres * 100).round(2)
+            summary_df["Area (Acres)"] = summary_df["area_acres"].round(2)
+            
+            rename_dict = {
+                "land_use_clean": "Land Use Code",
+                "hyg_clean": "Soil HSG",
+                "cn": "Curve Number (CN)",
+                "c": "Runoff Coeff (C)",
+                "grid_code": "Grid Code"
+                }
+            summary_renamed = summary_df.rename(columns=rename_dict)
+            table_cols = [c for c in ["Land Use Code", "Soil HSG", "Grid Code", "Curve Number (CN)", "Runoff Coeff (C)", "Area (Acres)", "% Area"] if c in summary_renamed.columns]
+            
+            formatted_df = summary_renamed[table_cols]
+            st.dataframe(formatted_df, use_container_width=True)
+
+            csv_bytes = formatted_df.to_csv(index=False).encode("utf-8")
+            
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
                 st.download_button(
-                    label="📦 Download Complete CN GIS Package (Watershed, SSURGO, NLCD & CN Shapefiles)",
-                    data=st.session_state["cn_zip_bytes"],
-                    file_name="cn_hydrology_project_all_shapefiles.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    type="primary",
+                    label="📊 Download CN Breakdown Summary (CSV)",
+                    data=csv_bytes,
+                    file_name="cn_breakdown_summary.csv",
+                    mime="text/csv",
+                    use_container_width=True
                 )
+
+            with col_dl2:
+                if "cn_zip_bytes" in st.session_state:
+                    st.download_button(
+                        label="📦 Download Complete CN GIS Package (Watershed, SSURGO, NLCD & CN Shapefiles)",
+                        data=st.session_state["cn_zip_bytes"],
+                        file_name="cn_hydrology_project_all_shapefiles.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        type="primary",
+                    )
+
+
+                
+                
+        # with col_res2:
+        #     if "cn_zip_bytes" in st.session_state:
+        #         st.download_button(
+        #             label="📦 Download Complete CN GIS Package (Watershed, SSURGO, NLCD & CN Shapefiles)",
+        #             data=st.session_state["cn_zip_bytes"],
+        #             file_name="cn_hydrology_project_all_shapefiles.zip",
+        #             mime="application/zip",
+        #             use_container_width=True,
+        #             type="primary",
+        #         )
 
     st.markdown("---")
     col_map_head, col_zoom_btn = st.columns([3, 1])
