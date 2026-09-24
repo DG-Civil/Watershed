@@ -3155,6 +3155,27 @@ with tab2:
         with col_res2:
             st.subheader("📋 CN Breakdown Table")
             
+            intersected_gdf = st.session_state["cn_intersected_gdf"]
+            
+            target_crs = intersected_gdf.crs
+            if target_crs is None or target_crs.is_geographic:
+                calc_gdf = intersected_gdf.to_crs("EPSG:5070")
+            else:
+                calc_gdf = intersected_gdf.copy()
+
+            crs_wkt = calc_gdf.crs.to_wkt().lower()
+            is_feet = "foot" in crs_wkt or "ft" in crs_wkt
+            
+            calc_gdf["area_sqm"] = calc_gdf.geometry.area
+            if is_feet:
+                calc_gdf["area_acres"] = calc_gdf["area_sqm"] / 43560.0
+            else:
+                calc_gdf["area_acres"] = calc_gdf["area_sqm"] / 4046.8564224
+
+            total_acres = calc_gdf["area_acres"].sum()
+
+            
+            
             summary_df = calc_gdf.copy()
             summary_df["% Area"] = (summary_df["area_acres"] / total_area_acres * 100).round(2)
             summary_df["Area (Acres)"] = summary_df["area_acres"].round(2)
